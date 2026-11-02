@@ -1,0 +1,46 @@
+name: Manually deploy collector code
+
+on:
+  workflow_dispatch:
+
+# Infrastructure is deployed separately by its owner. This workflow can update
+# one existing Lambda only, using the protected production environment.
+permissions:
+  contents: read
+
+concurrency:
+  group: production-collector-code
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    environment: production
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@e797f83bcb11b83ae66e0230d6156d7c80228e7c # v6.0.0
+        with:
+          python-version: '3.12'
+      - run: python -m unittest discover -s tests -v
+      - run: python scripts/package_lambda.py
+      - uses: aws-actions/configure-aws-credentials@61815dcd50bd041e203e49132bacad1fd04d2708 # v5.1.1
+        with:
+          role-to-assume: ${{ vars.AWS_DEPLOY_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION }}
+          role-session-name: heltemes-github-code-${{ github.run_id }}
+          role-duration-seconds: 900
+          allowed-account-ids: ${{ vars.AWS_ACCOUNT_ID }}
+      - name: Update one existing function and check completion
+        env:
+          COLLECTOR_FUNCTION: ${{ vars.LAMBDA_FUNCTION_NAME }}
+        run: |
+          test -n "$COLLECTOR_FUNCTION"
+          aws lambda update-function-code --function-name "$COLLECTOR_FUNCTION" --zip-file fileb://dist/collector.zip --query '{LastUpdateStatus:LastUpdateStatus,CodeSha256:CodeSha256}'
+          aws lambda wait function-updated-v2 --function-name "$COLLECTOR_FUNCTION"
+          aws lambda get-function-configuration --function-name "$COLLECTOR_FUNCTION" --query '{State:State,LastUpdateStatus:LastUpdateStatus,CodeSha256:CodeSha256}'

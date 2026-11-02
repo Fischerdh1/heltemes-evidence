@@ -1,0 +1,17 @@
+# Copy to terraform.tfvars locally; do not commit the copy or Terraform state.
+region          = "us-east-2"
+project_name    = "heltemes-evidence"
+sec_user_agent  = "HELTEMES Evidence/0.1 REPLACE_WITH_REAL_CONTACT"
+sec_cik         = "0000320193"
+sec_forms       = ["10-Q", "10-Q/A"]
+filing_limit    = 2
+enable_schedule = false
+
+# These create real AWS resources with usage charges. Review pricing first.
+enable_audit_trail = true
+alert_email       = ""
+monthly_budget_usd = 0
+
+# Optional: existing GitHub OIDC provider and verified exact subject.
+# github_oidc_provider_arn = "arn:aws:iam::ACCOUNT_ID:oidc-provider/token.actions.githubusercontent.com"
+# github_oidc_subject = "repo:OWNER@OWNER_ID/REPO@REPO_ID:environment:production"

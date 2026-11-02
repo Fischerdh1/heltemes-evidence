@@ -1,0 +1,12 @@
+output "evidence_bucket" { value = aws_s3_bucket.evidence.id }
+output "lambda_function_name" { value = aws_lambda_function.collector.function_name }
+output "collector_role_arn" { value = aws_iam_role.collector.arn }
+output "reader_policy_arn" { value = aws_iam_policy.reader.arn }
+output "log_group_name" { value = aws_cloudwatch_log_group.collector.name }
+output "schedule_name" { value = aws_scheduler_schedule.collector.name }
+output "schedule_group" { value = aws_scheduler_schedule_group.collector.name }
+output "schedule_enabled" { value = var.enable_schedule }
+output "audit_bucket" { value = one(aws_s3_bucket.audit[*].id) }
+output "trail_name" { value = one(aws_cloudtrail.research[*].name) }
+output "github_deployment_role_arn" { value = one(aws_iam_role.github_code_deployer[*].arn) }
+output "region" { value = var.region }

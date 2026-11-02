@@ -1,0 +1,119 @@
+[
+  {
+    "id": "01",
+    "title": "Follow the data",
+    "level": "Start here",
+    "focus": "Input → processing → output",
+    "explanation": "The demo command takes synthetic filing information as input. Python turns it into saved evidence and database records. The dashboard reads those outputs and presents them in your browser. The evidence is the data; the code describes what happens to it.",
+    "exercise": "Use a separate directory: python3 -m heltemes --data-dir work/lesson-01 demo. Run verify against the same directory, then serve it. Find the branch for the demo command in __main__.py and follow its call into core.py.",
+    "check": "Name one input, one processing step, and one output. Decisive clue: which files remain after you stop the server? Transfer check: change only the server port and explain why the saved evidence does not change.",
+    "files": [
+      "heltemes/__main__.py",
+      "heltemes/core.py",
+      "heltemes/fixtures/demo_submissions.json",
+      "docs/LEARNING_PATH.md"
+    ]
+  },
+  {
+    "id": "02",
+    "title": "Read JSON like a program",
+    "level": "Python foundations",
+    "focus": "Dictionaries, lists, loops, and validation",
+    "explanation": "JSON describes structured data. Python reads a JSON object as a dictionary and a JSON array as a list. SEC recent-filings data uses parallel arrays: the same position in each array belongs to the same filing. select_recent_filings checks their lengths before combining their values.",
+    "exercise": "Read the packaged synthetic input in heltemes/fixtures/demo_submissions.json, then select_recent_filings in sec.py. Identify the loop index and the values taken from that index. Predict what should happen if accessionNumber has two values but form has one. Find the validation that decides this.",
+    "check": "Name the data-shape error and its decisive clue: unequal array lengths. Explain why silently pairing the values could associate the wrong document with a filing. Transfer check: predict the behavior when primaryDocument is missing entirely.",
+    "files": [
+      "heltemes/fixtures/demo_submissions.json",
+      "heltemes/sec.py",
+      "tests/test_sec.py"
+    ]
+  },
+  {
+    "id": "03",
+    "title": "Trace a request across the network",
+    "level": "CCNA connection",
+    "focus": "DNS, connection, TLS, HTTP, and retries",
+    "explanation": "A live request needs the SEC hostname to resolve, a connection to succeed, TLS to protect the connection, and an HTTP response to arrive. A 403 response is evidence that an HTTP server replied; it is different from failing to resolve a name. A timeout alone does not identify exactly which network step failed.",
+    "exercise": "Read SecClient._get in sec.py. Find the timeout, request pacing, retry limit, and handling of HTTP 403. Use offline client tests before making live requests. For live collection, enter your real contact locally with python3 -m heltemes configure, then refresh the dashboard; you do not need to disclose it in chat.",
+    "check": "Scenario: the collector reports HTTP 403. Name the layer represented by that clue and explain why repeatedly changing DNS is not a justified first fix. Transfer check: explain how the evidence changes when there is no HTTP status and the request times out.",
+    "files": [
+      "heltemes/sec.py",
+      "tests/test_sec.py",
+      "docs/OPERATIONS.md"
+    ]
+  },
+  {
+    "id": "04",
+    "title": "Prove what a hash can prove",
+    "level": "Security foundations",
+    "focus": "Provenance, timestamps, and integrity",
+    "explanation": "Source acceptance time describes a source event; retrieval time describes this program's collection. A SHA-256 hash fingerprints bytes. An ordinary comparison can be defeated by changing both the file and its database hash. The signed checkpoint adds a reference outside that archive: changing previously sealed bytes or metadata then fails verification while that trusted reference stays intact.",
+    "exercise": "Use a separate practice archive and follow LOCAL_PROTECTION.md to initialize a checkpoint, save a receipt, back up, and restore. Change one byte only in a disposable restored evidence file, then verify again. Compare the ordinary byte check with the signed-checkpoint result. Preserve the original dataset and its trusted reference.",
+    "check": "Name the failed control and its decisive clue. Transfer check: if someone changes the file and database hash together, which separate reference catches that change? Explain why an attacker controlling the signing key and trusted reference is still outside this protection, and why checkpoint time is not independent proof of earlier possession.",
+    "files": [
+      "heltemes/core.py",
+      "heltemes/protection.py",
+      "docs/LOCAL_PROTECTION.md",
+      "docs/THREAT_MODEL.md"
+    ]
+  },
+  {
+    "id": "05",
+    "title": "Separate filings from collection attempts",
+    "level": "Database foundations",
+    "focus": "SQLite, identity, and repeatable collection",
+    "explanation": "The database is an index you can search; the preserved source is the evidence it points to. One filing can be encountered on several collection attempts. A stable identifier helps prevent duplicate filing rows while run records preserve the fact that collection happened again.",
+    "exercise": "Seed demo data twice into the same practice directory. Compare filing count and run history, then find the early return in seed_demo. Follow collect and _record, then read test_duplicate_collections_preserve_observations_without_new_filings in test_core.py: the test uses a fake SEC client to demonstrate live-path observations without network access. Identify mode in the uniqueness rule.",
+    "check": "Explain why the second demo command does not prove a new collection occurred. Decisive clue: seed_demo returns its prior successful run. Transfer check: explain how collect can record a new observation without adding a duplicate filing, and why a different amendment accession remains separate.",
+    "files": [
+      "heltemes/core.py",
+      "tests/test_core.py",
+      "docs/SOURCES.md"
+    ]
+  },
+  {
+    "id": "06",
+    "title": "Find the access boundary",
+    "level": "Security+ connection",
+    "focus": "Loopback, browser protections, and least privilege",
+    "explanation": "The dashboard binds to 127.0.0.1, checks the request's host and origin, and requires a token for changes. It can verify signed checkpoints but cannot create or reset them through its HTTP API. These controls are not a login or a separate operating-system identity: another process running as your user can still access the local signing key and trusted reference. Cloud IAM would introduce a separate identity boundary.",
+    "exercise": "Read DashboardServer and Handler.valid_host in server.py, then locate the token check in do_POST. Identify why signing is an explicit terminal step and why that alone does not isolate its private key from same-user software. When studying the AWS files, identify a role, its allowed action, and exact resource scope.",
+    "check": "Scenario: someone claims a read-only key file and no signing button protect the archive from malware running as the owner. Identify the mistaken assumption and decisive clue: the owner can read the key and change local permissions or references. Transfer check: explain what a separately controlled signing identity would add.",
+    "files": [
+      "heltemes/server.py",
+      "docs/LOCAL_PROTECTION.md",
+      "docs/THREAT_MODEL.md"
+    ]
+  },
+  {
+    "id": "07",
+    "title": "Recover and explain an incident",
+    "level": "Operations practice",
+    "focus": "Backups, restoration, and evidence",
+    "explanation": "A backup is a recovery possibility. A protected backup also needs a matching public trust receipt retained separately: the receipt tells restoration which signing identity and checkpoint to accept. Restoring into a new directory, checking that receipt, verifying the contents, and opening the expected records demonstrates recovery without replacing the original.",
+    "exercise": "Follow the protected recovery exercise in OPERATIONS.md using practice data. Record the checkpoint, public receipt, archive, destination, elapsed time, verification result, and any assistant help. Explain why the restored copy has verification material but no private signing key.",
+    "check": "Name the decisive recovery evidence: expected records open from the restored directory and checks pass against the independently retained receipt. Transfer check: why should an older backup fail against a newer checkpoint receipt, and what can neither a backup nor receipt on the same disk protect against?",
+    "files": [
+      "heltemes/core.py",
+      "docs/LOCAL_PROTECTION.md",
+      "docs/OPERATIONS.md",
+      "docs/LEARNING_PATH.md"
+    ]
+  },
+  {
+    "id": "08",
+    "title": "Explain the cloud before operating it",
+    "level": "Cloud foundations",
+    "focus": "Infrastructure as code and operational responsibility",
+    "explanation": "Terraform describes requested cloud resources. A plan describes proposed changes; it is not evidence that those changes are deployed. Deployment needs an actual account and identity. Operational proof also needs successful runs, stored output, tested permissions, working alerts, and reviewed costs.",
+    "exercise": "Read the infrastructure documentation. Draw the path from the schedule to the collector to storage and logs. Explain each role's access and how collection can be stopped. Before a future deployment, review the plan and distinguish files prepared locally from resources observed in AWS.",
+    "check": "Scenario: Terraform files exist and local tests pass. Can you claim a secure AWS service is operating? State what evidence is still missing. Transfer check: explain why a budget alert is not a hard spending cap and why an S3 data-event log needs explicit configuration.",
+    "files": [
+      "infra/main.tf",
+      "infra/variables.tf",
+      "cloud/handler.py",
+      "docs/SOURCES.md",
+      "docs/OPERATIONS.md"
+    ]
+  }
+]

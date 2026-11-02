@@ -1,0 +1,15 @@
+{
+  "_warning": "SYNTHETIC TRAINING FIXTURE. NOT A REAL COMPANY, FILING, RESULT, OR FORECAST. DATES AND IDENTIFIERS ARE INVENTED.",
+  "cik": "0000000001",
+  "name": "SYNTHETIC Training Company — DEMO ONLY",
+  "filings": {
+    "recent": {
+      "accessionNumber": ["0000000001-26-000003", "0000000001-26-000002", "0000000001-26-000001"],
+      "filingDate": ["2026-01-03", "2026-01-02", "2026-01-01"],
+      "acceptanceDateTime": ["2026-01-03T16:00:00Z", "2026-01-02T16:00:00Z", "2026-01-01T16:00:00Z"],
+      "form": ["10-Q/A", "8-K", "10-Q"],
+      "reportDate": ["2025-12-31", "2026-01-02", "2025-12-31"],
+      "primaryDocument": ["synthetic-amendment.htm", "synthetic-event.htm", "synthetic-quarter.htm"]
+    }
+  }
+}

@@ -1,0 +1,32 @@
+<!doctype html>
+<html lang="en">
+<head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>HELTEMES Evidence — Earnings Research Platform</title><link rel="stylesheet" href="/styles.css"><script defer src="/app.js"></script></head>
+<body>
+<a class="skip" href="#main">Skip to content</a>
+<div class="shell">
+<aside class="sidebar">
+<a class="brand" href="/"><span class="brand-mark" aria-hidden="true">H</span><span>HELTEMES<strong class="brand-product">EVIDENCE</strong><small>EARNINGS RESEARCH<br>PLATFORM</small></span></a>
+<div class="workspace-label">YOUR WORKSPACE</div>
+<nav aria-label="Main navigation">
+<button class="nav active" data-tab="overview"><span aria-hidden="true">◫</span> Research desk</button>
+<button class="nav" data-tab="evidence"><span aria-hidden="true">▤</span> Evidence library</button>
+<button class="nav" data-tab="runs"><span aria-hidden="true">↻</span> Collection runs</button>
+<button class="nav" data-tab="security"><span aria-hidden="true">◇</span> Security & recovery</button>
+<button class="nav" data-tab="learn"><span aria-hidden="true">⌘</span> Learn the system</button>
+</nav>
+<div class="side-note"><span class="live-dot"></span> LOCAL WORKSPACE<p>Your evidence stays on this computer. AWS deployment is prepared separately.</p></div>
+<div class="sidebar-footer"><span class="avatar">F</span><div>Fischer<small>Independent research project</small></div></div>
+</aside>
+<div class="page">
+<header class="topbar"><div><span class="breadcrumb">Workspace</span><span aria-hidden="true"> / </span><span id="crumb">Research desk</span></div><div class="top-status"><span class="live-dot"></span> Local access only <span class="version">v0.4</span></div></header>
+<main id="main" tabindex="-1">
+<div id="loading" class="loading">Opening your research workspace…</div>
+<div id="content" hidden></div>
+</main>
+<footer class="page-footer">Built for traceable research. Collection timestamps and hashes support integrity checks; they are not independent proof of historical possession.</footer>
+</div>
+</div>
+<div class="toast" id="toast" role="status" hidden></div>
+<dialog id="collect-dialog" aria-labelledby="collect-title"><form id="collect-form"><div class="dialog-head"><div><p class="eyebrow">SEC COLLECTION</p><h2 id="collect-title">Bring evidence into focus.</h2></div><button type="button" class="icon-button" data-close="collect-dialog" aria-label="Close dialog">×</button></div><p class="muted">Retrieve recent filing metadata and selected primary documents. The original responses are preserved.</p><div id="collection-config" class="notice"></div><label for="cik">Company CIK</label><input id="cik" name="cik" inputmode="numeric" pattern="[0-9]{1,10}" maxlength="10" required placeholder="e.g. 0000320193"><p class="field-help">The SEC’s company identifier. Confirm it against the company’s SEC record.</p><div class="form-grid"><div><label for="form-type">Filing type</label><select id="form-type"><option>10-Q</option><option>10-K</option><option>8-K</option><option>10-Q/A</option><option>10-K/A</option><option>20-F</option><option>6-K</option></select></div><div><label for="limit">Maximum filings</label><select id="limit"><option>1</option><option selected>3</option><option>5</option><option>10</option></select></div></div><p class="field-help">Recent submissions only. An 8-K may include earnings exhibits; this version downloads its primary document, not all exhibits.</p><div class="dialog-actions"><button type="button" class="button ghost" data-close="collect-dialog">Cancel</button><button class="button primary" id="collect-submit">Collect filings</button></div></form></dialog>
+<dialog id="detail-dialog" aria-labelledby="detail-title"><div class="dialog-head"><div><p class="eyebrow">EVIDENCE RECORD</p><h2 id="detail-title">Filing details</h2></div><button type="button" class="icon-button" data-close="detail-dialog" aria-label="Close dialog">×</button></div><div id="detail-body"></div></dialog>
+</body></html>
