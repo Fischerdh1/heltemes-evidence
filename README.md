@@ -1,8 +1,12 @@
 # HELTEMES Evidence
 
+[![Verify project](https://github.com/Fischerdh1/heltemes-evidence/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/Fischerdh1/heltemes-evidence/actions/workflows/ci.yml)
+
 **Earnings Research Platform**
 
 An original security-engineering portfolio project by **Fischer Heltemes**.
+
+**Hosted verification:** the first GitHub Actions run passed all 336 software tests on both Python 3.12 and 3.14 and validated the prepared Terraform configuration. See the [dated hosted-check record](docs/GITHUB_VERIFICATION.md). AWS remains undeployed.
 
 A local-first SEC evidence workspace with a Python collector, preserved source documents, a searchable dashboard, signed checkpoints, integrity checks, backup/recovery, and an eight-lesson learning path. AWS deployment code is included separately.
 
