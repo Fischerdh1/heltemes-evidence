@@ -57,7 +57,7 @@ jobs:
       - name: Install tools on the disposable Linux runner
         run: |
           sudo apt-get update
-          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y iproute2 nftables tcpdump
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y iproute2 nftables tcpdump openssl
       - name: Exercise isolated routing and firewall policy
         env:
           REVIEWER_PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
@@ -86,6 +86,34 @@ jobs:
         run: |
           cat work/network-lab/publish/SUMMARY.md >> "$GITHUB_STEP_SUMMARY"
           printf '\n[Download network lab evidence](%s)\n' "$ARTIFACT_URL" >> "$GITHUB_STEP_SUMMARY"
+      - name: Exercise DNS and TLS failure diagnosis
+        env:
+          REVIEWER_PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          sudo -n --preserve-env=GITHUB_ACTIONS,GITHUB_SHA,GITHUB_EVENT_NAME,GITHUB_REPOSITORY,GITHUB_RUN_ID,GITHUB_RUN_ATTEMPT,GITHUB_SERVER_URL,REVIEWER_PR_HEAD_SHA \
+            "$(command -v python3)" -I -S -B scripts/network_services_lab.py --output work/network-services
+      - name: Retain DNS and TLS lab evidence
+        id: services_evidence
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: network-services-${{ github.sha }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            work/network-services/publish/REPORT.json
+            work/network-services/publish/MANIFEST.json
+            work/network-services/publish/packet-capture.pcap
+            work/network-services/publish/packet-capture.txt
+            work/network-services/publish/policy.nft
+            work/network-services/publish/blocked-policy.nft
+            work/network-services/publish/certificates.json
+            work/network-services/publish/SUMMARY.md
+          if-no-files-found: error
+          retention-days: 30
+      - name: Show DNS and TLS results
+        env:
+          ARTIFACT_URL: ${{ steps.services_evidence.outputs.artifact-url }}
+        run: |
+          cat work/network-services/publish/SUMMARY.md >> "$GITHUB_STEP_SUMMARY"
+          printf '\n[Download DNS and TLS evidence](%s)\n' "$ARTIFACT_URL" >> "$GITHUB_STEP_SUMMARY"
 
   reviewer:
     needs: [python, terraform, network_lab]

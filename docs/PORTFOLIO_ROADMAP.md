@@ -29,6 +29,8 @@ Implementation can proceed with development assistance. Optional walkthroughs co
 
 The [network lab](NETWORK_LAB.md) is an additional implementation milestone configured to produce its own hosted run and packet evidence. Its checks distinguish a firewall denial from an unavailable service, detect an intentionally over-permissive rule, and verify the repair. Treat a particular run as complete only after its recorded checks, capture, and cleanup pass.
 
+The [DNS and TLS expansion](NETWORK_SERVICES_LAB.md) adds explicit name resolution, certificate-hostname and issuer checks, and a firewall-denied TLS scenario with a healthy-service control. Each run has its own source-bound report, packet evidence, temporary-key cleanup, and acceptance result. This advances the networking stage while AWS remains deferred.
+
 ## Proposed stages
 
 | Planning window | Engineering work | Evidence required | What Fischer should be able to do |

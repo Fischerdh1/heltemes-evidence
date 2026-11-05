@@ -2,6 +2,8 @@
 
 This lab adds a network-security case study to HELTEMES Evidence. It creates three Linux network namespaces, routes synthetic HTTP traffic through a firewall, detects an intentionally permissive rule, and verifies the repaired policy. Each run records the tested source, traffic observations, packet capture, firewall counters, and cleanup result.
 
+The [DNS and TLS expansion](NETWORK_SERVICES_LAB.md) adds a separate exercise on a fresh copy of this topology. It checks name resolution, server-certificate identity, an untrusted issuer, and a blocked TLS connection. Both exercises run within the required `network_lab` job and publish separate evidence packages.
+
 The lab operates inside a disposable Linux VM and uses synthetic content. It does not require administrator changes on the personal Mac or access to the real filing archive, signing key, or accepted trust history.
 
 The acceptance criteria below describe the required checks. A particular result is established by its completed `network_lab` job and inspection of the downloaded report. The [implementation and validation record](https://github.com/Fischerdh1/heltemes-evidence/pull/8) links the hosted runs and records the artifact review.
@@ -88,7 +90,7 @@ Show the regression. “The lab deliberately inserts a rule that opens the restr
 
 Point to the evidence. “The report ties those observations to the tested source and includes a packet capture, the rules, counters, and cleanup result. I can show the specific run and explain the expected and observed outcomes.”
 
-Keep the scope precise. The implemented case study concerns IPv4 routing, forwarding policy, synthetic HTTP probes, and investigation using counters and packet capture. TLS validation, DNS behavior, physical network devices, and operating a cloud environment are separate future milestones. The installed Evidence application's custody controls and real filing archive have their own verification records. AWS deployment remains deferred.
+Keep the scope precise. This routing exercise concerns IPv4 forwarding policy, synthetic HTTP probes, and investigation using counters and packet capture. DNS and TLS checks have their own [exercise and report](NETWORK_SERVICES_LAB.md). Physical network devices and operating a cloud environment remain separate future milestones. The installed Evidence application's custody controls and real filing archive have their own verification records. AWS deployment remains deferred.
 
 ## Implementation references
 
