@@ -63,11 +63,16 @@ def cut_fixture():
     after = {**copy.deepcopy(before), 'boot_id': BOOT_B, 'qemu_pid': 456,
              'uptime_seconds': 3., 'observed_elapsed_seconds': 30.}
     return {'point': 'before_commit', 'boundary': boundary_fixture(), 'boundary_recheck': boundary_fixture(), 'before': before, 'after': after,
+            'disk_cache_before_cut': lab.cache_evidence(block_fixture()),
             'signal': 'SIGKILL', 'qemu_wait_returncode': -9, 'old_qemu_reaped': True,
             'power_cut_elapsed_seconds': 21., 'qemu_terminated_elapsed_seconds': 22.,
             'cold_launch_elapsed_seconds': 23.,
             'ssh_unavailable_observed': True, 'new_qemu_process': True, 'same_disk': True,
             'guest_shutdown_requested': False, 'qemu_graceful_exit_requested': False}
+
+
+def block_fixture():
+    return [{'device': 'he-monitor-disk', 'inserted': {'drv': 'qcow2', 'ro': False, 'cache': dict(lab.CACHE)}}]
 
 
 def public_fixture():
@@ -114,6 +119,9 @@ def public_fixture():
                                             'committed_sequence': 7, 'evaluation': accepted_rows[6]['evaluation'],
                                             'current_status': status(8, 300, 'c' * 32)}}
     files = {name: b'public fixture' for name in lab.GUEST_FILES}
+    for phase, record in (('before', before), ('after', after)):
+        record['capture_sha256'] = {name: lab.hashlib.sha256(files[name]).hexdigest()
+                                    for name in files if name.startswith(phase + '-')}
     files.update({'BEFORE.json': json.dumps(before).encode(), 'AFTER_BEFORE.json': json.dumps(middle).encode(),
                   'AFTER.json': json.dumps(after).encode(), 'monitor.service': unit})
     references = {name: files[name] for name in ('BEFORE.json', 'AFTER_BEFORE.json')}
@@ -169,9 +177,9 @@ class PowercutHostTests(unittest.TestCase):
             self.assertNotIn('scripts/network_monitor_powercut_vm.py', archive.getnames())
 
     def test_disk_cache_requires_observed_direct_io_and_flushes(self):
-        blocks = [{'device': 'he-monitor-disk', 'inserted': {'drv': 'qcow2', 'ro': False, 'cache': dict(lab.CACHE)}}]
+        blocks = block_fixture()
         self.assertEqual(lab.cache_evidence(blocks)['cache'], lab.CACHE)
-        for key in lab.CACHE:
+        for key in ('direct', 'no-flush'):
             with self.subTest(key=key):
                 bad = copy.deepcopy(blocks)
                 bad[0]['inserted']['cache'][key] = not bad[0]['inserted']['cache'][key]
@@ -180,6 +188,38 @@ class PowercutHostTests(unittest.TestCase):
         for bad in ([], blocks * 2, [{'device': 'another-disk', 'inserted': blocks[0]['inserted']}], [{}]):
             with self.assertRaises(RuntimeError):
                 lab.cache_evidence(bad)
+
+    def test_guest_negotiated_writethrough_is_recorded_without_relaxing_direct_io_or_flushes(self):
+        blocks = block_fixture()
+        blocks[0]['inserted']['cache']['writeback'] = False
+        evidence = lab.cache_evidence(blocks)
+        self.assertIs(evidence['cache']['writeback'], False)
+        self.assertIs(evidence['cache']['direct'], True)
+        self.assertIs(evidence['cache']['no-flush'], False)
+        lab.validate_cache_record(evidence)
+        for value in (None, 0, 1, 'false', []):
+            blocks[0]['inserted']['cache']['writeback'] = value
+            with self.assertRaises(RuntimeError):
+                lab.cache_evidence(blocks)
+
+    def test_cache_failure_diagnostics_select_safe_fields_and_never_private_paths(self):
+        blocks = block_fixture()
+        blocks[0]['inserted'].update(file='/private/disk-key', backing_file='/private/base-key',
+                                     drv='/private/invalid-driver')
+        blocks[0]['inserted']['cache']['writeback'] = '/private/invalid-value'
+        with self.assertRaises(RuntimeError) as caught:
+            lab.cache_evidence(blocks)
+        message = str(caught.exception)
+        self.assertIn('invalid-or-missing', message)
+        self.assertIn('"direct": true', message)
+        self.assertIn('"no-flush": false', message)
+        self.assertNotIn('/private/', message)
+
+    def test_pre_cut_cache_readback_cannot_disable_flushes_after_boot(self):
+        value = cut_fixture()
+        value['disk_cache_before_cut']['cache']['no-flush'] = True
+        with self.assertRaisesRegex(RuntimeError, 'flush settings'):
+            lab.validate_power_cut(value)
 
     def test_cut_requires_stopped_worker_bound_to_current_boot_and_point(self):
         lab.validate_boundary(boundary_fixture(), 'before_commit', BOOT_A)
@@ -214,6 +254,7 @@ class PowercutHostTests(unittest.TestCase):
         old.poll.side_effect = [None, -signal.SIGKILL]
         old.wait.return_value = -signal.SIGKILL
         vm.process, vm.qmp, vm.log = old, Mock(), Mock()
+        vm.qmp.command.return_value = block_fixture()
         evidence = cut_fixture()
         def launch(previous):
             self.assertIsNone(vm.process)
@@ -238,6 +279,7 @@ class PowercutHostTests(unittest.TestCase):
     def test_wrong_termination_status_cannot_be_reported_as_power_cut(self):
         vm = lab.DisposableVM(TOOLS)
         vm.process, vm.qmp, vm.log = Mock(), Mock(), Mock()
+        vm.qmp.command.return_value = block_fixture()
         vm.process.poll.return_value = None
         vm.process.wait.return_value = 0
         with patch.object(vm, 'boot_snapshot', return_value=cut_fixture()['before']), \
@@ -279,6 +321,29 @@ class PowercutHostTests(unittest.TestCase):
                 args = copy.deepcopy(arguments); mutate(*args)
                 with self.assertRaises(RuntimeError):
                     lab.validate_preserved_history(*args)
+
+    def test_damaged_capture_cannot_be_blessed_by_a_later_manifest(self):
+        references, files, source, cuts = public_fixture()
+        files['before-user.pcap'] = b'valid prefix' + bytes(512)
+        with self.assertRaisesRegex(RuntimeError, 'before capture bytes'):
+            lab.validate_preserved_history(references, files, source, cuts)
+        # Rewriting the guest report to accept the damaged file still conflicts
+        # with the exact report bytes retained on the host before either cut.
+        before = json.loads(files['BEFORE.json'])
+        before['capture_sha256']['before-user.pcap'] = lab.hashlib.sha256(files['before-user.pcap']).hexdigest()
+        files['BEFORE.json'] = json.dumps(before).encode()
+        with self.assertRaisesRegex(RuntimeError, 'retained outside'):
+            lab.validate_preserved_history(references, files, source, cuts)
+
+    def test_capture_fingerprint_inventory_must_include_all_six_completed_files(self):
+        for phase, report in (('before', 'BEFORE.json'), ('after', 'AFTER.json')):
+            references, files, source, cuts = public_fixture()
+            value = json.loads(files[report]); del value['capture_sha256'][phase + '-user-packets.txt']
+            files[report] = json.dumps(value).encode()
+            if report in references:
+                references[report] = files[report]
+            with self.assertRaisesRegex(RuntimeError, 'capture bytes'):
+                lab.validate_preserved_history(references, files, source, cuts)
 
     def test_self_consistent_guest_cannot_replace_host_recorded_committed_row(self):
         references, files, source, cuts = public_fixture()

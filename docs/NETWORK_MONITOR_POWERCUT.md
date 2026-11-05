@@ -10,6 +10,8 @@ Persistent history and the enabled boot service already exist in the reboot lab.
 
 The lab journal also uses SQLite `synchronous=EXTRA` with rollback-journal DELETE mode. This adds a directory sync after journal removal, strengthening durability of the most recent completed transaction. The existing database schema and identity remain unchanged; no real Evidence database is migrated.
 
+Finished packet captures and their text summaries are flushed to disk before the first cut. Their fingerprints are included in the pre-cut reference retained by the host. Recovery checks those earlier fingerprints again, so a later manifest cannot silently legitimize damaged capture bytes. This preparation happens before the transaction is armed; the paused transaction does not receive an extra persistent-disk flush from the test harness.
+
 A host-observed boundary signal determines when to cut power. A delay chosen by guesswork would not establish whether a transaction had completed. The controller retains reference bytes outside the guest before each cut and compares the recovered journal against them.
 
 ## Walk through recovery
@@ -58,7 +60,7 @@ Use this wording after the corresponding actual VM run and downloaded evidence p
 
 ## Limits
 
-This is an abrupt **guest power-loss simulation**. The host computer and its physical storage remain powered. QEMU uses explicit `cache=none`, which requests direct disk I/O while honoring guest flushes; this does not prove physical storage hardware correctly handles power failure. The test does not inject torn sectors, controller faults, disk loss, or every possible interruption inside SQLite's commit implementation.
+This is an abrupt **guest power-loss simulation**. The host computer and its physical storage remain powered. QEMU uses explicit `cache=none`, which requests direct disk I/O while honoring guest flushes. The controller verifies those properties before and after boot and immediately before each cut. The guest can change its reported writeback-cache flag; either boolean value is recorded, while direct I/O and enabled flushes remain mandatory. This does not prove physical storage hardware correctly handles power failure. The test does not inject torn sectors, controller faults, disk loss, or every possible interruption inside SQLite's commit implementation.
 
 The precommit case proves an interrupted request was not accepted. It does not, by itself, prove that SQLite replayed a hot rollback journal; some pending changes may still have been in memory when the VM was killed. SQLite's atomic-commit design depends on filesystem and storage behavior, including reliable flushes.
 
@@ -69,4 +71,5 @@ This is a bounded lab with submitted observations, not continuous production mon
 - [SQLite atomic commits, interrupted transactions, and storage assumptions](https://www.sqlite.org/atomiccommit.html)
 - [SQLite synchronous modes and directory synchronization](https://www.sqlite.org/pragma.html#pragma_synchronous)
 - [QEMU disk cache settings](https://www.qemu.org/docs/master/system/invocation.html)
+- [QEMU 8.2.2 cache reporting](https://github.com/qemu/qemu/blob/v8.2.2/block/qapi.c) and [guest-controlled virtio writeback setting](https://github.com/qemu/qemu/blob/v8.2.2/hw/block/virtio-blk.c)
 - [Existing full VM reboot implementation and evidence](NETWORK_MONITOR_REBOOT.md)

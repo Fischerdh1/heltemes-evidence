@@ -384,6 +384,67 @@ def read_report(name):
     return store.parse(path.read_bytes())
 
 
+def capture_fingerprint(path, *, synchronize=False):
+    """Read one completed, bounded capture through its checked file descriptor."""
+    before = path.lstat()
+    require(stat.S_ISREG(before.st_mode) and before.st_uid == os.geteuid()
+            and before.st_nlink == 1 and 0 < before.st_size <= 8 * 1024 * 1024,
+            'Completed capture must be a bounded, owned, singly linked regular file.')
+    descriptor = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    try:
+        opened = os.fstat(descriptor)
+        require((opened.st_dev, opened.st_ino) == (before.st_dev, before.st_ino), 'Capture identity changed while opening.')
+        # Completed captures are prepared before arming a transaction cut. This
+        # sync is never called from the paused transaction boundary callback.
+        if synchronize:
+            os.fsync(descriptor)
+        digest, size = hashlib.sha256(), 0
+        while True:
+            block = os.read(descriptor, 65536)
+            if not block:
+                break
+            size += len(block)
+            require(size <= 8 * 1024 * 1024, 'Completed capture exceeds its byte bound.')
+            digest.update(block)
+        after = os.fstat(descriptor)
+        require(size == before.st_size == after.st_size and before.st_mtime_ns == after.st_mtime_ns
+                and after.st_nlink == 1, 'Completed capture changed while reading.')
+        return digest.hexdigest()
+    finally:
+        os.close(descriptor)
+
+
+def seal_captures(staging, stage_name):
+    """Persist completed evidence and bind its exact bytes before a VM cut."""
+    require(stage_name in {'before', 'after'}, 'Unknown capture stage.')
+    store.state_path(staging); store.state_path(PUBLISH)
+    checksums = {}
+    for filename in CAPTURE_FILES:
+        source = staging / filename
+        public_name = stage_name + '-' + filename
+        destination = PUBLISH / public_name
+        require(not destination.exists() and not destination.is_symlink(), 'Completed capture must not replace existing evidence.')
+        checksums[public_name] = capture_fingerprint(source, synchronize=True)
+        source.rename(destination)
+    store.sync_directory(staging)
+    store.sync_directory(PUBLISH)
+    verify_captures({'capture_sha256': checksums}, stage_name)
+    return checksums
+
+
+def verify_captures(report, stage_name):
+    require(stage_name in {'before', 'after'}, 'Unknown capture stage.')
+    store.state_path(PUBLISH)
+    checksums = report.get('capture_sha256')
+    expected = {stage_name + '-' + filename for filename in CAPTURE_FILES}
+    require(isinstance(checksums, dict) and set(checksums) == expected
+            and all(isinstance(value, str) and reboot.re.fullmatch(r'[0-9a-f]{64}', value) for value in checksums.values()),
+            'Saved capture fingerprints do not cover the exact six public files.')
+    for name, expected_digest in checksums.items():
+        require(capture_fingerprint(PUBLISH / name) == expected_digest, 'Completed capture bytes changed across the VM cut: ' + name)
+    return copy.deepcopy(checksums)
+
+
 def stage(name, token):
     virtualization = guard(token)
     boot, hashes = reboot.boot_info(virtualization), source_hashes()
@@ -396,6 +457,7 @@ def stage(name, token):
     else:
         for path in (DATA, STATE, REPORT, PUBLISH, RUNTIME):
             store.state_path(path)
+        preserved_captures = verify_captures(read_report('BEFORE.json'), 'before')
     output = {'before': 'BEFORE.json', 'after-before': 'AFTER_BEFORE.json', 'after-after': 'AFTER.json'}[name]
     require(not (PUBLISH / output).exists(), 'Completed stage must not be repeated.')
     if name == 'after-before':
@@ -409,14 +471,14 @@ def stage(name, token):
             outcome = run_before(lab, token) if name == 'before' else run_after(lab, read_report('AFTER_BEFORE.json'), boot, hashes, storage_info(), token)
         finally:
             cleanup = lab.cleanup(); require(cleanup['ok'], 'Guest network cleanup failed.')
-        for filename in CAPTURE_FILES:
-            path = staging / filename
-            require(path.is_file() and not path.is_symlink(), 'A completed packet capture is missing.')
-            path.rename(PUBLISH / (stage_name + '-' + filename))
+        outcome['capture_sha256'] = seal_captures(staging, stage_name)
     result = {'format': 'heltemes-monitor-powercut-guest', 'version': 1, 'ok': True, 'stage': name,
               'boot': boot, 'source_sha256': hashes, 'storage': storage_info(),
               'unit_sha256': hashlib.sha256(unit_text(token).encode()).hexdigest(),
               'network_cleanup': cleanup, 'completed_at_utc': timestamp(), **outcome}
+    if name != 'before':
+        result['before_capture_bytes_verified'] = True
+        result['preserved_before_capture_sha256'] = preserved_captures
     require(source_hashes() == hashes, 'Guest source changed during collection.')
     write_new(PUBLISH / output, result)
     if name == 'before':

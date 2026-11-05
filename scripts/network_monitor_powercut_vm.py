@@ -80,10 +80,31 @@ def cache_evidence(blocks):
     require(len(matches) == 1 and isinstance(matches[0].get("inserted"), dict),
             "QEMU did not expose exactly one owned monitor disk.")
     inserted = matches[0]["inserted"]
-    require(inserted.get("drv") == "qcow2" and inserted.get("ro") is False
-            and inserted.get("cache") == CACHE, "QEMU disk does not honor the required direct I/O and flush settings.")
+    observed = inserted.get("cache")
+    # query-block's writeback is the guest-controlled device WCE state, not
+    # the immutable host cache.direct/no-flush open flags. Virtio may negotiate
+    # writethrough during boot; QEMU adds FUA to writes when WCE is disabled.
+    # Preserve either observed boolean while requiring direct I/O and flushes.
+    cache = {key: observed.get(key) for key in CACHE} if isinstance(observed, dict) else {}
+    safe_boolean = lambda value: value if type(value) is bool else "invalid-or-missing"
+    driver = inserted.get("drv")
+    diagnostic = {"driver": driver if isinstance(driver, str) and reboot.re.fullmatch(r"[a-z0-9_-]{1,32}", driver) else "invalid-or-missing",
+                  "read_only": safe_boolean(inserted.get("ro")),
+                  "cache": {key: safe_boolean(cache.get(key)) for key in CACHE}}
+    require(driver == "qcow2" and inserted.get("ro") is False
+            and isinstance(observed, dict) and set(observed) == set(CACHE)
+            and type(cache.get("writeback")) is bool and cache.get("direct") is True and cache.get("no-flush") is False,
+            "QEMU disk does not honor the required direct I/O and flush settings: " + json.dumps(diagnostic, sort_keys=True))
     return {"device": "he-monitor-disk", "driver": "qcow2", "read_only": False,
-            "requested_cache_mode": "none", "cache": dict(CACHE)}
+            "requested_cache_mode": "none", "cache": cache}
+
+
+def validate_cache_record(record):
+    require(isinstance(record, dict) and record.get("device") == "he-monitor-disk"
+            and record.get("requested_cache_mode") == "none", "The owned disk cache record is invalid.")
+    observed = cache_evidence([{"device": record["device"], "inserted": {
+        "drv": record.get("driver"), "ro": record.get("read_only"), "cache": record.get("cache")}}])
+    require(record == observed, "The selected disk cache record contains unexpected fields.")
 
 
 class DisposableVM(reboot.DisposableVM):
@@ -125,6 +146,7 @@ class DisposableVM(reboot.DisposableVM):
         progress("guest SSH ready; checking clean cloud-init completion")
         result = self.ssh("sudo -n cloud-init status --wait --format json", timeout=360, check=False)
         cloud_init = reboot.cloud_init_status(result, self.redact)
+        settled_cache = cache_evidence(self.qmp.command("query-block"))
         if not self.installed:
             progress("installing only the allowlisted synthetic lab source")
             self.ssh("sudo -n mkdir -p " + GUEST_ROOT + " && sudo -n tar -xz --no-same-owner -f - -C " + GUEST_ROOT,
@@ -132,7 +154,7 @@ class DisposableVM(reboot.DisposableVM):
             self.installed = True
         self.boots.append({"boot_number": len(self.boots) + 1, "snapshot": snapshot,
                            "launch_started_elapsed_seconds": self.last_launch_started,
-                           "disk_cache": disk_cache, "qmp_kvm": self.kvm_status,
+                           "disk_cache": disk_cache, "disk_cache_after_boot": settled_cache, "qmp_kvm": self.kvm_status,
                            "cloud_init": cloud_init, "source_uploaded": previous is None})
         return snapshot
 
@@ -163,6 +185,7 @@ class DisposableVM(reboot.DisposableVM):
                 and recheck["manager"]["InvocationID"] == boundary["manager"]["InvocationID"],
                 "The live stopped transaction boundary differs from its host-held reference.")
         self.require_running()
+        disk_cache = cache_evidence(self.qmp.command("query-block"))
         requested = time.monotonic() - self.started
         process = self.process
         process.kill()  # SIGKILL: no guest shutdown and no QEMU exit/flush handler.
@@ -179,6 +202,7 @@ class DisposableVM(reboot.DisposableVM):
         progress(point + ": whole VM killed; cold-starting its retained disk")
         after = self.launch(previous=before)
         evidence = {"point": point, "boundary": boundary, "boundary_recheck": recheck, "before": before, "after": after,
+                    "disk_cache_before_cut": disk_cache,
                     "signal": "SIGKILL", "qemu_wait_returncode": result, "old_qemu_reaped": True,
                     "power_cut_elapsed_seconds": requested, "qemu_terminated_elapsed_seconds": terminated,
                     "cold_launch_elapsed_seconds": self.last_launch_started,
@@ -232,6 +256,7 @@ def validate_boundary(boundary, point, boot_id):
 def validate_power_cut(value):
     before, after = value["before"], value["after"]
     require(value["point"] in POINTS, "Unknown cut point.")
+    validate_cache_record(value["disk_cache_before_cut"])
     validate_boundary(value["boundary"], value["point"], before["boot_id"])
     validate_boundary(value["boundary_recheck"], value["point"], before["boot_id"])
     require(canonical(value["boundary"]["boundary"]) == canonical(value["boundary_recheck"]["boundary"]),
@@ -271,6 +296,14 @@ def validate_preserved_history(references, files, source, cuts):
     for cut in cuts:
         validate_power_cut(cut)
     before, middle, after = [json.loads(files[name]) for name in ("BEFORE.json", "AFTER_BEFORE.json", "AFTER.json")]
+    for phase, record in (("before", before), ("after", after)):
+        names = {phase + "-" + zone + suffix for zone in ("user", "app", "management")
+                 for suffix in (".pcap", "-packets.txt")}
+        hashes = record.get("capture_sha256")
+        require(isinstance(hashes, dict) and set(hashes) == names
+                and all(isinstance(checksum, str) and reboot.re.fullmatch(r"[0-9a-f]{64}", checksum)
+                        and hashlib.sha256(files[name]).hexdigest() == checksum for name, checksum in hashes.items()),
+                "The exported " + phase + " capture bytes differ from their completed-stage fingerprints.")
     expected = {name: source["source_sha256"][name] for name in GUEST_SOURCE_FILES}
     require(all(record["source_sha256"] == expected for record in (before, middle, after)),
             "Guest source bytes differ from the host-verified committed source.")
@@ -425,7 +458,7 @@ The host killed the whole owned QEMU process with SIGKILL at two explicitly obse
 
 At the first cut, the worker had inserted a candidate row but had not committed it. The original five accepted rows survived; the uncommitted request was absent. Automatic startup appended row six with unknown monitoring coverage and the same unresolved incident. At the second cut, SQLite had committed row seven but the caller had not received acknowledgement. That exact host-recorded row survived once. Automatic startup appended row eight; retrying the exact request returned its original result without adding a duplicate or claiming current health. Fresh rules, a valid counter interval, and all three network canaries were required for healthy recovery at row eleven.
 
-Inspect VM.json for the stopped transaction worker, live boundary recheck, SIGKILL wait result, cold boots, verified cache settings, references retained outside the VM, and cleanup evidence. BEFORE.json, AFTER_BEFORE.json, and AFTER.json preserve the journal and network observations. Before/after packet captures substantiate the actual network checks.
+Inspect VM.json for the stopped transaction worker, live boundary recheck, SIGKILL wait result, cold boots, verified cache settings, references retained outside the VM, and cleanup evidence. BEFORE.json, AFTER_BEFORE.json, and AFTER.json preserve the journal and network observations. Before/after packet captures substantiate the actual network checks. Completed capture files are flushed before arming the first transaction, and their fingerprints in the host-held BEFORE.json bind the final exported bytes to those pre-cut files. No persistent-disk sync is added at either paused transaction boundary.
 
 The journal uses SQLite DELETE journaling with synchronous=EXTRA, verified by readback. QEMU cache=none uses direct host I/O and honors flushes. The host computer and physical storage remained powered. This is an abrupt guest-power-loss simulation, not a physical host power-failure, torn-sector, failed-device-flush, or hostile-administrator rollback test. The precommit boundary does not by itself establish that a hot journal needed replay. This bounded exercise does not install a continuous production collector. AWS and real Evidence keys/history were outside the exercise.
 

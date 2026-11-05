@@ -1,10 +1,12 @@
 """Portable boundary/replay checks; real guest power cuts are a separate CI VM test."""
 import copy
+import hashlib
 import importlib.util
 import json
 import os
 from pathlib import Path
 import signal
+import stat
 import subprocess
 import tempfile
 import unittest
@@ -271,6 +273,93 @@ class PowerCutBoundaryTests(unittest.TestCase):
         if os.sys.platform == 'darwin':
             self.assertNotEqual(result.returncode, 0)
             self.assertIn(b'Disposable Linux guest required', result.stderr)
+
+
+class CaptureDurabilityTests(unittest.TestCase):
+    def setUp(self):
+        temporary = tempfile.TemporaryDirectory(prefix='powercut-capture-tests-')
+        self.addCleanup(temporary.cleanup)
+        self.directory = Path(temporary.name).resolve()
+        self.staging, self.publish = self.directory / 'staging', self.directory / 'publish'
+        self.staging.mkdir(mode=0o700); self.publish.mkdir(mode=0o700)
+        patcher = patch.object(guest, 'PUBLISH', self.publish); patcher.start(); self.addCleanup(patcher.stop)
+        self.contents = {name: ('completed synthetic bytes for ' + name).encode() for name in guest.CAPTURE_FILES}
+        for name, data in self.contents.items():
+            (self.staging / name).write_bytes(data)
+
+    def test_each_completed_file_is_synced_before_rename_then_both_parents_sync(self):
+        events = []
+        inodes = {(self.staging / name).stat().st_ino: name for name in guest.CAPTURE_FILES}
+        real_fsync, real_rename, real_sync_directory = os.fsync, Path.rename, store.sync_directory
+        def fsync(descriptor):
+            info = os.fstat(descriptor)
+            if stat.S_ISREG(info.st_mode):
+                events.append(('file_sync', inodes[info.st_ino]))
+            return real_fsync(descriptor)
+        def rename(source, destination):
+            events.append(('rename', source.name)); return real_rename(source, destination)
+        def sync_directory(path):
+            events.append(('directory_sync', path.name)); return real_sync_directory(path)
+        with patch.object(guest.os, 'fsync', side_effect=fsync), patch.object(Path, 'rename', rename), \
+             patch.object(guest.store, 'sync_directory', side_effect=sync_directory):
+            checksums = guest.seal_captures(self.staging, 'before')
+        expected = [event for name in guest.CAPTURE_FILES for event in [('file_sync', name), ('rename', name)]]
+        self.assertEqual(events, expected + [('directory_sync', 'staging'), ('directory_sync', 'publish')])
+        self.assertEqual(checksums, {'before-' + name: hashlib.sha256(data).hexdigest() for name, data in self.contents.items()})
+        self.assertEqual(guest.verify_captures({'capture_sha256': checksums}, 'before'), checksums)
+
+    def test_fsync_failure_stops_before_rename_or_reference_acceptance(self):
+        with patch.object(guest.os, 'fsync', side_effect=OSError('simulated failed flush')), \
+             patch.object(Path, 'rename') as rename, self.assertRaisesRegex(OSError, 'failed flush'):
+            guest.seal_captures(self.staging, 'before')
+        rename.assert_not_called()
+        self.assertEqual(list(self.publish.iterdir()), [])
+        self.assertEqual(len(list(self.staging.iterdir())), 6)
+
+    def test_zero_filled_capture_tail_is_rejected_against_pre_cut_fingerprint(self):
+        checksums = guest.seal_captures(self.staging, 'before')
+        path = self.publish / 'before-user.pcap'; original = path.read_bytes()
+        path.write_bytes(original[:10] + bytes(len(original) - 10))
+        with self.assertRaisesRegex(RuntimeError, 'capture bytes changed'):
+            guest.verify_captures({'capture_sha256': checksums}, 'before')
+        path.write_bytes(original)
+        self.assertEqual(guest.verify_captures({'capture_sha256': checksums}, 'before'), checksums)
+
+    def test_reference_requires_exact_six_stage_names_and_valid_fingerprints(self):
+        checksums = guest.seal_captures(self.staging, 'before')
+        missing = dict(checksums); missing.pop('before-user.pcap')
+        wrong = dict(checksums); wrong['before-user.pcap'] = 'wrong'
+        extra = {**checksums, '../outside': 'a' * 64}
+        for changed in (None, missing, wrong, extra):
+            with self.subTest(changed=changed), self.assertRaisesRegex(RuntimeError, 'exact six'):
+                guest.verify_captures({'capture_sha256': changed}, 'before')
+        with self.assertRaisesRegex(RuntimeError, 'exact six'):
+            guest.verify_captures({'capture_sha256': checksums}, 'after')
+
+    def test_symlink_and_hardlink_captures_are_rejected_before_sync(self):
+        first = self.staging / guest.CAPTURE_FILES[0]
+        original = first.read_bytes(); first.unlink()
+        other = self.directory / 'other'; other.write_bytes(original)
+        for linked in ('symlink', 'hardlink'):
+            if linked == 'symlink':
+                first.symlink_to(other)
+            else:
+                os.link(other, first)
+            with patch.object(guest.os, 'fsync') as fsync, self.assertRaisesRegex(RuntimeError, 'singly linked regular'):
+                guest.seal_captures(self.staging, 'before')
+            fsync.assert_not_called(); first.unlink()
+
+    def test_both_post_cut_stages_verify_old_capture_bytes_before_recovery(self):
+        for stage in ('after-before', 'after-after'):
+            with patch.object(guest, 'guard', return_value='qemu'), patch.object(guest.reboot, 'boot_info', return_value={}), \
+                 patch.object(guest, 'source_hashes', return_value={}), patch.object(guest.store, 'state_path'), \
+                 patch.object(guest, 'read_report', return_value={'capture_sha256': {}}), \
+                 patch.object(guest, 'verify_captures', side_effect=RuntimeError('changed saved capture')) as verify, \
+                 patch.object(guest, 'after_first') as first, patch.object(guest, 'run_after') as second:
+                with self.assertRaisesRegex(RuntimeError, 'changed saved capture'):
+                    guest.stage(stage, 'a' * 32)
+                verify.assert_called_once_with({'capture_sha256': {}}, 'before')
+                first.assert_not_called(); second.assert_not_called()
 
 
 if __name__ == '__main__':
