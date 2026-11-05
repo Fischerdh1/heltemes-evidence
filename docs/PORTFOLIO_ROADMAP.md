@@ -41,6 +41,8 @@ The [full-reboot expansion](NETWORK_MONITOR_REBOOT.md) separately tests an order
 
 The [virtual power-cut expansion](NETWORK_MONITOR_POWERCUT.md) tests two abrupt guest interruptions on the same disk: before transaction commit and after commit before acknowledgement. Acceptance requires observed whole-VM termination, automatic startup on a new kernel boot, exact committed-history recovery, an idempotent retry, and fresh network verification. The host remains powered; this does not establish physical storage power-loss behavior.
 
+The [automatic monitoring expansion](NETWORK_MONITOR_AUTOMATIC.md) adds bounded unattended collection and independent freshness deadlines. Acceptance requires silence to become unknown without a status request, preservation of the existing incident while rules are repaired, an observed supervisor restart, and fresh baseline/canary evidence before recovery. Longer retention, collector/network reconstruction across boot, separate-account authority, and external notification delivery remain separate milestones.
+
 ## Proposed stages
 
 | Planning window | Engineering work | Evidence required | What Fischer should be able to do |

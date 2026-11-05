@@ -334,9 +334,59 @@ jobs:
           cat work/monitor-powercut/publish/SUMMARY.md >> "$GITHUB_STEP_SUMMARY"
           printf '\n[Download virtual power-loss evidence](%s)\n' "$ARTIFACT_URL" >> "$GITHUB_STEP_SUMMARY"
 
+  monitor_automatic:
+    needs: [python]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@e797f83bcb11b83ae66e0230d6156d7c80228e7c # v6.0.0
+        with:
+          python-version: '3.14'
+      - name: Install disposable guest VM tools
+        run: |
+          sudo apt-get update
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y qemu-system-x86 qemu-utils cloud-image-utils openssh-client curl
+      - name: Exercise automatic collection and missing-data recovery
+        env:
+          REVIEWER_PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          mkdir -p work
+          python3 -I -S -B scripts/network_monitor_automatic_vm.py --output work/monitor-automatic
+      - name: Retain automatic monitoring evidence
+        id: automatic_evidence
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: monitor-automatic-${{ github.sha }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            work/monitor-automatic/publish/REPORT.json
+            work/monitor-automatic/publish/VM.json
+            work/monitor-automatic/publish/SUMMARY.md
+            work/monitor-automatic/publish/MANIFEST.json
+            work/monitor-automatic/publish/GUEST.json
+            work/monitor-automatic/publish/APPROVED_POLICY.json
+            work/monitor-automatic/publish/monitor.service
+            work/monitor-automatic/publish/collector.service
+            work/monitor-automatic/publish/user.pcap
+            work/monitor-automatic/publish/user-packets.txt
+            work/monitor-automatic/publish/app.pcap
+            work/monitor-automatic/publish/app-packets.txt
+            work/monitor-automatic/publish/management.pcap
+            work/monitor-automatic/publish/management-packets.txt
+          if-no-files-found: error
+          retention-days: 30
+      - name: Show automatic monitoring results
+        env:
+          ARTIFACT_URL: ${{ steps.automatic_evidence.outputs.artifact-url }}
+        run: |
+          cat work/monitor-automatic/publish/SUMMARY.md >> "$GITHUB_STEP_SUMMARY"
+          printf '\n[Download automatic monitoring evidence](%s)\n' "$ARTIFACT_URL" >> "$GITHUB_STEP_SUMMARY"
+
   reviewer:
     if: ${{ always() }}
-    needs: [python, terraform, network_lab, monitor_reboot, monitor_powercut]
+    needs: [python, terraform, network_lab, monitor_reboot, monitor_powercut, monitor_automatic]
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
@@ -347,9 +397,9 @@ jobs:
           python3 - <<'PY'
           import json, os
           results = json.loads(os.environ['PREREQUISITE_RESULTS'])
-          expected = {'python', 'terraform', 'network_lab', 'monitor_reboot', 'monitor_powercut'}
+          expected = {'python', 'terraform', 'network_lab', 'monitor_reboot', 'monitor_powercut', 'monitor_automatic'}
           if set(results) != expected or any(value.get('result') != 'success' for value in results.values()):
-              raise SystemExit('Reviewer blocked: every prerequisite, including the VM reboot and abrupt virtual power loss, must succeed.')
+              raise SystemExit('Reviewer blocked: every prerequisite, including VM reboot, abrupt virtual power loss, and automatic missing-data recovery, must succeed.')
           PY
       - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
         with:

@@ -8,22 +8,21 @@ import unittest
 
 
 class MonitorCIGateTests(unittest.TestCase):
-    def test_workflow_guard_rejects_unsuccessful_or_missing_powercut(self):
+    def test_workflow_guard_rejects_unsuccessful_or_missing_vm_job(self):
         workflow = (Path(__file__).resolve().parents[1] / '.github/workflows/ci.yml').read_text()
         reviewer = workflow.split('\n  reviewer:\n', 1)[1]
         self.assertIn('    if: ${{ always() }}\n', reviewer)
-        self.assertIn('    needs: [python, terraform, network_lab, monitor_reboot, monitor_powercut]\n', reviewer)
+        self.assertIn('    needs: [python, terraform, network_lab, monitor_reboot, monitor_powercut, monitor_automatic]\n', reviewer)
         self.assertIn('PREREQUISITE_RESULTS: ${{ toJSON(needs) }}', reviewer)
         guard = reviewer.split("          python3 - <<'PY'\n", 1)[1].split('\n          PY', 1)[0]
         script = '\n'.join(line[10:] for line in guard.splitlines())
-        names = ('python', 'terraform', 'network_lab', 'monitor_reboot', 'monitor_powercut')
+        names = ('python', 'terraform', 'network_lab', 'monitor_reboot', 'monitor_powercut', 'monitor_automatic')
         passing = {name: {'result': 'success'} for name in names}
         cases = [(passing, True)]
-        for state in ('failure', 'skipped', 'cancelled', 'in_progress', None):
-            cases.append(({**passing, 'monitor_powercut': {'result': state}}, False))
-        cases.append(({key: value for key, value in passing.items() if key != 'monitor_powercut'}, False))
         for prerequisite in names:
-            cases.append(({**passing, prerequisite: {'result': 'failure'}}, False))
+            for state in ('failure', 'skipped', 'cancelled', 'in_progress', None):
+                cases.append(({**passing, prerequisite: {'result': state}}, False))
+            cases.append(({key: value for key, value in passing.items() if key != prerequisite}, False))
         for results, accepted in cases:
             with self.subTest(results=results):
                 process = subprocess.run([sys.executable, '-I', '-S', '-B', '-c', script],
