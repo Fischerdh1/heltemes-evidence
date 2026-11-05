@@ -1,8 +1,10 @@
 # Reviewable evidence for each change
 
-The `reviewer` job in `Verify project` runs after both Python test jobs, Terraform validation, and the isolated Linux network lab succeed. It creates a fresh synthetic archive, runs the existing 12-phase demonstration, packages the source and results, and retains a downloadable artifact for 30 days. A new run has its own identifiers and timestamps. The network lab retains its own packet capture and policy observations. See [the network lab guide](NETWORK_LAB.md) for that separate report.
+The `reviewer` job in `Verify project` runs after both Python test jobs, Terraform validation, the isolated Linux network lab, and the full guest-reboot exercise succeed. It creates a fresh synthetic archive, runs the existing 12-phase demonstration, packages the source and results, and retains a downloadable artifact for 30 days. A new run has its own identifiers and timestamps. The network lab retains its own packet capture and policy observations. See [the network lab guide](NETWORK_LAB.md) for that separate report.
 
 The required `network_lab` job runs the routing/firewall exercise, the [DNS/TLS exercise](NETWORK_SERVICES_LAB.md), the [segmentation exercise](NETWORK_SEGMENTATION.md), the [monitoring exercise](NETWORK_MONITORING.md), and the [service-restart exercise](NETWORK_MONITOR_RESTART.md). Each has a separate artifact. A successful earlier exercise does not establish that the entire job passed; verify all five results and the final job status. DNS/TLS uploads exclude temporary private keys. All five artifacts use the same 30-day retention period.
+
+The separate `monitor_reboot` job boots and reboots a disposable Ubuntu guest, verifies persistent monitoring state and automatic service startup, and publishes a sixth network artifact. Its [full-reboot guide](NETWORK_MONITOR_REBOOT.md) explains the additional evidence. The required `reviewer` job runs its prerequisite guard even if an earlier job fails or is skipped, and explicitly requires all prerequisite results to be `success`. A dependency alone would allow the reviewer job to be skipped, which is insufficient as an explicit success gate.
 
 ## Inspect a run
 
@@ -53,3 +55,4 @@ The builder requires source parity with the current Git commit. Commit an intend
 - [GitHub workflow artifacts and retention](https://docs.github.com/en/actions/tutorials/store-and-share-data)
 - [Pull-request workflow events and merge commits](https://docs.github.com/en/actions/reference/workflows-and-actions/events-that-trigger-workflows#pull_request)
 - [Upload Artifact action inputs and download behavior](https://github.com/actions/upload-artifact)
+- [Required checks and skipped dependent jobs](https://docs.github.com/en/pull-requests/how-tos/merge-and-close-pull-requests/troubleshooting-required-status-checks)

@@ -37,6 +37,8 @@ The [monitoring expansion](NETWORK_MONITORING.md) adds sampled rule comparison, 
 
 The [service-restart expansion](NETWORK_MONITOR_RESTART.md) adds a transactional monitoring journal and a transient Linux service. Its acceptance requires real process exits, supervisor restarts, preserved committed incidents, idempotent retries, and fresh recovery evidence. It does not establish VM reboot, physical power-loss, or production-operation behavior.
 
+The [full-reboot expansion](NETWORK_MONITOR_REBOOT.md) separately tests an orderly Linux guest reboot using persistent disk storage and an enabled boot service. Acceptance requires changed boot identity, automatic startup, exact preservation of committed history, and fresh recovery observations. Physical power loss and continuous production operation remain separate milestones.
+
 ## Proposed stages
 
 | Planning window | Engineering work | Evidence required | What Fischer should be able to do |
