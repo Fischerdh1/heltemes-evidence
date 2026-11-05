@@ -41,7 +41,9 @@ The [full-reboot expansion](NETWORK_MONITOR_REBOOT.md) separately tests an order
 
 The [virtual power-cut expansion](NETWORK_MONITOR_POWERCUT.md) tests two abrupt guest interruptions on the same disk: before transaction commit and after commit before acknowledgement. Acceptance requires observed whole-VM termination, automatic startup on a new kernel boot, exact committed-history recovery, an idempotent retry, and fresh network verification. The host remains powered; this does not establish physical storage power-loss behavior.
 
-The [automatic monitoring expansion](NETWORK_MONITOR_AUTOMATIC.md) adds bounded unattended collection and independent freshness deadlines. Acceptance requires silence to become unknown without a status request, preservation of the existing incident while rules are repaired, an observed supervisor restart, and fresh baseline/canary evidence before recovery. Longer retention, collector/network reconstruction across boot, separate-account authority, and external notification delivery remain separate milestones.
+The [automatic monitoring expansion](NETWORK_MONITOR_AUTOMATIC.md) adds bounded unattended collection and independent freshness deadlines. Acceptance requires silence to become unknown without a status request, preservation of the existing incident while rules are repaired, an observed supervisor restart, and fresh baseline/canary evidence before recovery. Collector/network reconstruction across boot, separate-account authority, and external notification delivery remain separate milestones.
+
+The [history archive expansion](NETWORK_MONITOR_ARCHIVE.md) adds finite segmented retention beyond the original active-journal limit. Acceptance requires real automatic observations across two rollovers, preserved incident identity, both archive handoff process-crash recoveries, exact retries, and altered/missing segment rejection. Indefinite operation, automatic expiry, independent custody, and archive-aware full-VM power-loss testing remain separate milestones.
 
 ## Proposed stages
 

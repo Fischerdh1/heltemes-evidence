@@ -12,11 +12,11 @@ class MonitorCIGateTests(unittest.TestCase):
         workflow = (Path(__file__).resolve().parents[1] / '.github/workflows/ci.yml').read_text()
         reviewer = workflow.split('\n  reviewer:\n', 1)[1]
         self.assertIn('    if: ${{ always() }}\n', reviewer)
-        self.assertIn('    needs: [python, terraform, network_lab, monitor_reboot, monitor_powercut, monitor_automatic]\n', reviewer)
+        self.assertIn('    needs: [python, terraform, network_lab, monitor_reboot, monitor_powercut, monitor_automatic, monitor_archive]\n', reviewer)
         self.assertIn('PREREQUISITE_RESULTS: ${{ toJSON(needs) }}', reviewer)
         guard = reviewer.split("          python3 - <<'PY'\n", 1)[1].split('\n          PY', 1)[0]
         script = '\n'.join(line[10:] for line in guard.splitlines())
-        names = ('python', 'terraform', 'network_lab', 'monitor_reboot', 'monitor_powercut', 'monitor_automatic')
+        names = ('python', 'terraform', 'network_lab', 'monitor_reboot', 'monitor_powercut', 'monitor_automatic', 'monitor_archive')
         passing = {name: {'result': 'success'} for name in names}
         cases = [(passing, True)]
         for prerequisite in names:
