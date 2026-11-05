@@ -2,7 +2,7 @@
 
 Proposed roadmap, November 4, 2026. Fischer's goal is to develop demonstrable network and cloud security experience over the next three years. Progress is measured by completed work, saved results, and the ability to explain and repeat the work. The time windows below can change as skills and priorities develop.
 
-HELTEMES Evidence is the current flagship project. Its evidence-integrity and recovery exercises are case studies within that project. A separate network-security lab is a proposed future project. AWS deployment remains deferred until Fischer explicitly resumes it.
+HELTEMES Evidence is the current flagship project. Its evidence-integrity, recovery, and isolated Linux network lab are case studies within the repository. The network lab supplies an initial routing/firewall exercise to expand into broader network-security work. AWS deployment remains deferred until Fischer explicitly resumes it.
 
 ## Verified starting point
 
@@ -25,14 +25,16 @@ Per-commit reviewer artifacts are the first additional milestone. The workflow r
 
 GitHub workflow artifacts support storing build and test outputs after a run. Their retention period is bounded by repository settings, so a CI download has an expiry that reviewers should be able to identify. [GitHub artifact documentation](https://docs.github.com/en/actions/tutorials/store-and-share-data)
 
-Fischer's accompanying exercise is to trace one failed phase through its result and source code, explain the rejected operation, make a small reviewed change, and rerun the relevant check. Record the actual level of help and understanding in the contribution log. A lesson receives completion credit when its demonstration is performed. [Contribution and learning log](LEARNING_PATH.md#contribution-and-learning-log)
+Implementation can proceed with development assistance. Optional walkthroughs connect each completed change to its source and observed results, including why a check rejected an operation and how the fix was verified. Record the actual level of help and understanding in the contribution log. A lesson receives completion credit when its demonstration is performed. [Contribution and learning log](LEARNING_PATH.md#contribution-and-learning-log)
+
+The [network lab](NETWORK_LAB.md) is an additional implementation milestone configured to produce its own hosted run and packet evidence. Its checks distinguish a firewall denial from an unavailable service, detect an intentionally over-permissive rule, and verify the repair. Treat a particular run as complete only after its recorded checks, capture, and cleanup pass.
 
 ## Proposed stages
 
 | Planning window | Engineering work | Evidence required | What Fischer should be able to do |
 | --- | --- | --- | --- |
 | November 2026–April 2027 | Maintain HELTEMES Evidence, finish CI reviewer artifacts, review a real dependency update, and complete an off-device recovery exercise when a destination is available | Passing run and downloaded artifact, reviewed change with relevant checks, independently retained receipt and verified restore | Follow collection through Python and SQLite, explain timestamps and trust references, diagnose a failing check, and make a small change with a testable reason |
-| May 2027–April 2028 | Build a separately scoped network-security lab using Linux services, segmentation, firewall rules, DNS/TLS investigation, and logs | Saved topology and configuration, permitted and denied traffic tests, packet captures, and an incident investigation with a verified fix | Trace packet flow, explain why a connection succeeds or fails, interpret relevant logs, and change a rule without breaking required access |
+| May 2027–April 2028, or earlier as implementation progresses | Expand the initial network lab with Linux service administration, additional segmentation, DNS/TLS investigation, and logs | Saved topology and configuration, permitted and denied traffic tests, packet captures, and an incident investigation with a verified fix | Trace packet flow, explain why a connection succeeds or fails, interpret relevant logs, and change a rule without breaking required access |
 | May 2028–April 2029, subject to an explicit decision to resume AWS | Deploy and operate the prepared Evidence cloud collector in a controlled account with scoped identities, audit events, recovery, alerts, and cost controls | Live permission tests including denied operations, version recovery, captured audit events, a tested notification path, measured costs, and verified teardown | Explain each role's authority, distinguish configuration from effective access, investigate a failed collection, recover an object, and account for operating cost |
 | May–November 2029 | Maintain the systems and prepare selected case studies around actual design decisions, failures, and improvements | Dated releases, maintenance records, repeated recovery exercises, measured operational results, and a reproducible interview demonstration | Explain tradeoffs, diagnose a new variation of a failure, defend the scope of a result, and identify the next useful improvement |
 
