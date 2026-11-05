@@ -1,6 +1,6 @@
 # Reviewable evidence for each change
 
-The `reviewer` job in `Verify project` runs after both Python test jobs and the Terraform validation job succeed. It creates a fresh synthetic archive, runs the existing 12-phase demonstration, packages the source and results, and retains a downloadable artifact for 30 days. A new run has its own identifiers and timestamps.
+The `reviewer` job in `Verify project` runs after both Python test jobs, Terraform validation, and the isolated Linux network lab succeed. It creates a fresh synthetic archive, runs the existing 12-phase demonstration, packages the source and results, and retains a downloadable artifact for 30 days. A new run has its own identifiers and timestamps. The network lab retains its own packet capture and policy observations. See [the network lab guide](NETWORK_LAB.md) for that separate report.
 
 ## Inspect a run
 
