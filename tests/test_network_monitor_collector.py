@@ -4,6 +4,7 @@ import json
 import os
 from pathlib import Path
 import tempfile
+import subprocess
 import unittest
 from unittest.mock import Mock, patch
 
@@ -65,6 +66,38 @@ class CollectorTests(unittest.TestCase):
         invalid = copy.deepcopy(config); invalid['namespaces']['user'] = 'he-seg-9876543210-user'
         with self.assertRaisesRegex(RuntimeError, 'different labs'):
             collector.validate_config(invalid)
+
+    def test_attached_reader_uses_delegated_names_without_namespace_ownership(self):
+        config = {'version': 1, 'interval_seconds': 5.0,
+                  'namespaces': {r: 'he-seg-0123456789-' + r for r in ('user', 'app', 'management', 'router')}}
+        tools = {'ip': '/tools/ip', 'nft': '/tools/nft'}
+        lab = collector.AttachedLab(tools, self.directory, config)
+        self.assertEqual(lab.created_names, [])
+        # Exercise the real ruleset -> run_in -> namespace_command chain. The
+        # previous constructor-only mock hid the empty-created_names failure.
+        with patch.object(collector.reboot.base.subprocess, 'run', return_value=subprocess.CompletedProcess([], 0, '{"nftables": []}', '')) as run:
+            self.assertEqual(lab.ruleset(), {'nftables': []})
+        self.assertEqual(run.call_args.args[0], ['/tools/ip', 'netns', 'exec', config['namespaces']['router'],
+                                               '/tools/nft', '-j', '-a', 'list', 'ruleset'])
+        with self.assertRaisesRegex(RuntimeError, 'cannot create'):
+            lab.setup()
+        with self.assertRaisesRegex(RuntimeError, 'does not own'):
+            lab.cleanup()
+        with self.assertRaisesRegex(RuntimeError, 'only reads'):
+            lab.apply_policy()
+        with self.assertRaisesRegex(RuntimeError, 'only reads'):
+            lab.namespace_command('user', ['touch', '/unrelated'])
+        probe = [collector.sys.executable, '-I', '-S', '-B', '-c', collector.monitoring.segmentation.PROBE_CODE,
+                 collector.monitoring.segmentation.ZONES['app'], '9090', collector.monitoring.segmentation.ZONES['user'], '42006']
+        self.assertEqual(lab.namespace_command('user', probe)[:4], ['/tools/ip', 'netns', 'exec', config['namespaces']['user']])
+        lab.names['router'] = 'unrelated-router'
+        with self.assertRaisesRegex(RuntimeError, 'delegated'):
+            lab.ruleset()
+        # The original owner class still refuses commands in adopted namespaces.
+        owner = collector.monitoring.MonitoringLab(tools, self.directory)
+        owner.names = config['namespaces']
+        with self.assertRaisesRegex(RuntimeError, 'exclusively created'):
+            owner.ruleset()
 
     def test_reference_then_all_live_canaries_and_health_control_are_committed(self):
         allocation = self.allocation()

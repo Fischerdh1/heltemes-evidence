@@ -6,6 +6,7 @@ import importlib.util
 import os
 from pathlib import Path
 import tempfile
+import subprocess
 import unittest
 from unittest.mock import patch
 
@@ -53,6 +54,28 @@ class AutomaticGuestTests(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, 'cannot submit'):
                 guest.request('observe')
             request.assert_not_called()
+
+    def test_startup_diagnostics_are_fixed_bounded_and_redacted(self):
+        secret = 'a' * 32
+        def result(arguments, **options):
+            if arguments[0] == 'systemctl':
+                return subprocess.CompletedProcess(arguments, 0, 'ActiveState=failed\nNRestarts=3\nEnvironment=PRIVATE=value\n', '')
+            return subprocess.CompletedProcess(arguments, 0,
+                'Scoped namespace operation failed\n/var/lib/private-marker ' + secret + '\n' + 'z' * 2000, '')
+        with patch.object(guest, 'command', side_effect=result) as command:
+            diagnostics = guest.startup_diagnostics()
+        self.assertEqual(set(diagnostics), {guest.MONITOR_UNIT, guest.COLLECTOR_UNIT})
+        self.assertEqual(command.call_count, 4)
+        text = str(diagnostics)
+        self.assertNotIn(secret, text)
+        self.assertNotIn('/var/lib', text)
+        self.assertNotIn('PRIVATE=value', text)
+        self.assertIn('Scoped namespace operation failed', text)
+        for record in diagnostics.values():
+            self.assertTrue(all(len(line) <= 240 for line in record['recent_log'].splitlines()))
+        for call in command.call_args_list:
+            self.assertEqual(call.kwargs, {'check': False, 'timeout': 5})
+            self.assertIn(call.args[0][0], ('systemctl', 'journalctl'))
 
     def inventory(self):
         records, rows = [], []

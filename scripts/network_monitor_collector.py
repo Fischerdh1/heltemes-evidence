@@ -90,6 +90,37 @@ def validate_config(value):
     return names
 
 
+class AttachedLab(monitoring.MonitoringLab):
+    """Read/probe only the namespace names delegated by the guarded harness.
+
+    The collector did not create these namespaces and does not acquire their
+    lifecycle ownership. Keep the normal NamespaceLab ownership guard unchanged.
+    """
+    def __init__(self, tools, staging, config):
+        names = validate_config(config)
+        super().__init__(tools, staging)
+        self.names = dict(names)
+        self._authorized_names = dict(names)
+
+    def namespace_command(self, role, arguments):
+        require(role in self._authorized_names and self.names.get(role) == self._authorized_names[role],
+                'Collector namespace differs from its explicitly delegated lab scope.')
+        read_rules = role == 'router' and arguments == [self.tools['nft'], '-j', '-a', 'list', 'ruleset']
+        probe_prefix = [sys.executable, '-I', '-S', '-B', '-c', monitoring.segmentation.PROBE_CODE]
+        probe = (role in monitoring.segmentation.ZONES and len(arguments) == 10
+                 and arguments[:6] == probe_prefix and arguments[6] in monitoring.segmentation.ZONES.values()
+                 and arguments[7] in {'8080', '9090'} and arguments[8] == monitoring.segmentation.ZONES[role]
+                 and arguments[9].isdecimal() and 40000 <= int(arguments[9]) < 50000)
+        require(read_rules or probe, 'An attached collector only reads nft rules and runs bounded synthetic probes.')
+        return [self.tools['ip'], 'netns', 'exec', self._authorized_names[role], *arguments]
+
+    def setup(self):
+        raise RuntimeError('An attached collector cannot create namespaces.')
+
+    def cleanup(self):
+        raise RuntimeError('An attached collector does not own namespace cleanup.')
+
+
 class Collector:
     def __init__(self, lab, allocation, *, state=STATE, interval=INTERVAL):
         self.lab, self.allocation, self.state, self.interval = lab, allocation, state, interval
@@ -161,9 +192,7 @@ def main():
             store.state_path(path)
         reboot.ordinary(CONFIG)
         require(CONFIG.stat().st_size < 4096, 'Oversized collector configuration.')
-        names = validate_config(store.parse(CONFIG.read_bytes()))
-        lab = monitoring.MonitoringLab(reboot.base.preflight(), PRIVATE)
-        lab.names = names
+        lab = AttachedLab(reboot.base.preflight(), PRIVATE, store.parse(CONFIG.read_bytes()))
         allocation = Allocation(PRIVATE)
         collector = Collector(lab, allocation)
         signal.signal(signal.SIGTERM, collector.stop)

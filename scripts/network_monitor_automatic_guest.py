@@ -130,7 +130,37 @@ def wait_status(predicate, timeout=45):
         except (OSError, ValueError):
             pass
         time.sleep(0.2)
-    raise RuntimeError('Autonomous monitor condition timed out: ' + (reboot.evaluation_diagnostic(last) if last else 'unavailable'))
+    raise RuntimeError('Autonomous monitor condition timed out: '
+                       + (reboot.evaluation_diagnostic(last) if last else 'unavailable')
+                       + '; bounded startup diagnostics: ' + json.dumps(startup_diagnostics(), sort_keys=True))
+
+
+def sanitize_diagnostic(value):
+    """Retain error descriptions while omitting paths and ephemeral identifiers."""
+    value = value[:16384]
+    value = re.sub(r'(?i)\b[0-9a-f]{32,}\b', '<identifier>', value)
+    value = re.sub(r'/[^\s\"\'<>]+', '<guest-path>', value)
+    return '\n'.join(''.join(c for c in line if c.isprintable())[:240] for line in value.splitlines()[-12:])
+
+
+def startup_diagnostics():
+    """Inspect only our two fixed units, never environment, marker, or credentials."""
+    result = {}
+    fields = ('ActiveState', 'SubState', 'MainPID', 'NRestarts', 'ExecMainCode', 'ExecMainStatus', 'Result')
+    for unit in (MONITOR_UNIT, COLLECTOR_UNIT):
+        record = {}
+        try:
+            properties = command(['systemctl', 'show', '--no-pager', '--property=' + ','.join(fields), unit],
+                                 check=False, timeout=5)
+            record['service'] = {key: sanitize_diagnostic(value) for line in properties.stdout.splitlines()
+                                 if '=' in line for key, value in [line.split('=', 1)] if key in fields}
+            logs = command(['journalctl', '--no-pager', '--output=cat', '--lines=12', '--unit=' + unit],
+                           check=False, timeout=5)
+            record['recent_log'] = sanitize_diagnostic(logs.stdout)
+        except (OSError, ValueError, RuntimeError, subprocess.SubprocessError):
+            record['diagnostic_unavailable'] = True
+        result[unit] = record
+    return result
 
 
 def snapshot(started):
