@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import argparse
 from datetime import datetime, timezone
+import math
 import os
 from pathlib import Path
 import signal
@@ -19,6 +20,8 @@ from scripts import network_monitor_store as store
 SOCKET_NAME = "monitor.sock"
 CRASH_CODES = {"before_commit": 71, "after_commit_before_ack": 72}
 MAX_RESPONSE = 16 * 1024 * 1024
+IO_SECONDS = 3.0
+TICK_SECONDS = 0.2
 
 
 def utc_now():
@@ -31,10 +34,22 @@ def socket_path(state):
     return path
 
 
-def receive(connection, limit):
+def receive(connection, limit, *, deadline=None, tick=None):
     value = bytearray()
     while not value.endswith(b"\n"):
-        part = connection.recv(min(65536, limit + 1 - len(value)))
+        if deadline is not None:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise TimeoutError("Complete request deadline exceeded.")
+            connection.settimeout(min(TICK_SECONDS, remaining))
+            if tick is not None:
+                tick()
+        try:
+            part = connection.recv(min(65536, limit + 1 - len(value)))
+        except socket.timeout:
+            if deadline is None:
+                raise
+            continue
         if not part:
             raise ValueError("Connection closed before a complete response.")
         value.extend(part)
@@ -58,23 +73,94 @@ def request(state, payload, timeout=10):
 
 
 class Service:
-    def __init__(self, journal, allow_test_crashes=False, test_pause=None):
+    def __init__(self, journal, allow_test_crashes=False, test_pause=None, *, freshness_seconds=None):
+        store.require(freshness_seconds is None or (type(freshness_seconds) in (int, float)
+                      and math.isfinite(freshness_seconds) and 1 <= freshness_seconds <= 30),
+                      "Freshness threshold must be a finite number from 1 to 30 seconds.")
         self.journal, self.allow_test_crashes = journal, allow_test_crashes
         # Only the separately guarded disposable VM worker installs this hook.
         # The ordinary service CLI never enables a transaction pause.
         self.test_pause = test_pause
         self.instance_id = uuid.uuid4().hex
         self.started = time.monotonic()
+        self.started_at_utc = utc_now()
+        self.freshness_seconds = freshness_seconds
+        self.last_accepted = None
+        self.gap_attempted = False
+        self.gap_sequence = None
+        self.gap_committed_at_utc = None
+        self.persistence_error = None
+        self.outage_number = 0
         self.base_elapsed = journal.rows[-1]["sample"]["elapsed_seconds"] if journal.rows else 0.0
         # An accepted restart boundary is required before serving any request.
         journal.append("_restart_" + self.instance_id,
             {"phase": "monitor_restart", "observed_at_utc": utc_now(), "ruleset": None,
              "collection_error": "monitor_restarted", "probes": []}, self.base_elapsed, restart=True)
 
+    def _age(self):
+        if self.last_accepted is None:
+            return time.monotonic() - self.started
+        return (time.monotonic() - self.last_accepted["monotonic"]
+                + self.last_accepted["source_age_seconds"])
+
+    def tick(self):
+        """Commit a missing-data boundary even while no caller asks for status."""
+        if self.freshness_seconds is None:
+            return
+        if len(self.journal.rows) >= store.MAX_ROWS:
+            self.persistence_error = self.persistence_error or "journal_capacity_exhausted"
+        if self.persistence_error or self.gap_attempted or self._age() < self.freshness_seconds:
+            return
+        self.gap_attempted = True
+        self.outage_number += 1
+        observed = utc_now()
+        try:
+            result = self.journal.append(f"freshness-gap-{self.instance_id}-{self.outage_number}",
+                {"phase": "collector_missing", "observed_at_utc": observed, "ruleset": None,
+                 "collection_error": "freshness_deadline_exceeded", "probes": []},
+                self.base_elapsed + time.monotonic() - self.started)
+        except (OSError, ValueError, store.sqlite3.Error):
+            self.persistence_error = "journal_write_failed"
+            return
+        self.gap_sequence = result["committed_sequence"]
+        self.gap_committed_at_utc = utc_now()
+        if len(self.journal.rows) >= store.MAX_ROWS:
+            self.persistence_error = "journal_capacity_exhausted"
+
     def status(self):
-        return {"process_id": os.getpid(), "instance_id": self.instance_id, **self.journal.status()}
+        self.tick()
+        result = {"process_id": os.getpid(), "instance_id": self.instance_id, **self.journal.status()}
+        if self.freshness_seconds is None:
+            return result
+        age = max(0.0, self._age())
+        accepted = self.last_accepted or {}
+        expired = age >= self.freshness_seconds
+        result["freshness"] = {
+            "enabled": True, "threshold_seconds": self.freshness_seconds,
+            "last_accepted_request_id": accepted.get("request_id"),
+            "last_accepted_source_at_utc": accepted.get("source_at_utc"),
+            "last_accepted_at_utc": accepted.get("received_at_utc"),
+            "age_seconds": age if self.last_accepted else None,
+            "waiting_seconds": age if self.last_accepted is None else 0.0,
+            "remaining_seconds": max(0.0, self.freshness_seconds - age),
+            "deadline_at_utc": datetime.fromtimestamp((accepted.get("source_timestamp")
+                if self.last_accepted else store.monitor.utc(self.started_at_utc))
+                + self.freshness_seconds, timezone.utc).isoformat(),
+            "expired": expired, "gap_recorded": self.gap_sequence is not None,
+            "gap_sequence": self.gap_sequence, "gap_committed_at_utc": self.gap_committed_at_utc,
+            "capacity_remaining": max(0, store.MAX_ROWS - len(self.journal.rows)),
+            "persistence_error": self.persistence_error,
+        }
+        if self.last_accepted is None or expired or self.persistence_error:
+            evaluation = result["current_evaluation"]
+            evaluation["status"] = "unknown"
+            evaluation["telemetry_valid"] = False
+            reason = self.persistence_error or ("freshness_deadline_exceeded" if expired else "awaiting_fresh_telemetry")
+            evaluation["diagnostics"].append(reason)
+        return result
 
     def dispatch(self, payload):
+        self.tick()
         store.require(isinstance(payload, dict), "Request must be an object.")
         command = payload.get("command")
         if command == "status":
@@ -82,7 +168,8 @@ class Service:
             return {"ok": True, **self.status()}
         if command == "export":
             store.require(set(payload) == {"command"}, "Unexpected export fields.")
-            return {"ok": True, **self.journal.export(), "current_status": self.status()}
+            status = self.status()
+            return {"ok": True, **self.journal.export(), "current_status": status}
         store.require(command == "observe" and set(payload) in (
             {"command", "request_id", "observation"}, {"command", "request_id", "observation", "test_crash"},
             {"command", "request_id", "observation", "test_pause"}),
@@ -92,18 +179,46 @@ class Service:
         pause = payload.get("test_pause")
         store.require("test_pause" not in payload or (self.test_pause is not None and pause in CRASH_CODES),
                       "Test pause is disabled or invalid.")
+        source_time, source_age, received, received_monotonic = None, None, None, None
+        duplicate = any(row["request_id"] == payload["request_id"] for row in self.journal.rows)
+        if self.freshness_seconds is not None and not duplicate:
+            self.journal._validate_observation(payload["observation"])
+            store.require(isinstance(payload["request_id"], str)
+                          and store.REQUEST_ID.fullmatch(payload["request_id"]), "Request ID is invalid.")
+            store.require(self.persistence_error is None, "Journal persistence is unavailable.")
+            source_time = store.monitor.utc(payload["observation"]["observed_at_utc"])
+            received = utc_now()
+            received_monotonic = time.monotonic()
+            source_age = store.monitor.utc(received) - source_time
+            store.require(0 <= source_age < self.freshness_seconds, "Source timestamp is stale or in the future.")
+            store.require(self.last_accepted is None or source_time > self.last_accepted["source_timestamp"],
+                          "Source timestamp does not advance the last accepted fresh observation.")
+            store.require(source_time >= store.monitor.utc(self.journal.rows[-1]["sample"]["observed_at_utc"]),
+                          "Source timestamp precedes the latest committed observation boundary.")
         def fault(current):
             if current == point:
                 os._exit(CRASH_CODES[current])
             if current == pause:
                 self.test_pause(self, current, payload)
                 raise RuntimeError("A test pause must not return to normal service.")
-        result = self.journal.append(payload["request_id"], payload["observation"],
-                    self.base_elapsed + time.monotonic() - self.started, fault=fault if point or pause else None)
+        try:
+            result = self.journal.append(payload["request_id"], payload["observation"],
+                        self.base_elapsed + time.monotonic() - self.started, fault=fault if point or pause else None)
+        except (OSError, ValueError, store.sqlite3.Error):
+            if self.freshness_seconds is not None and not duplicate:
+                self.persistence_error = "journal_write_failed"
+            raise
+        if self.freshness_seconds is not None and not result["duplicate"] and result["evaluation"]["telemetry_valid"]:
+            self.last_accepted = {"request_id": payload["request_id"], "source_timestamp": source_time,
+                "source_at_utc": payload["observation"]["observed_at_utc"], "received_at_utc": received,
+                "monotonic": received_monotonic, "source_age_seconds": source_age}
+            self.gap_attempted = False
+            self.gap_sequence = None
+            self.gap_committed_at_utc = None
         return {"ok": True, **result, "result_is_historical": result["duplicate"], "current_status": self.status()}
 
 
-def serve(state, *, allow_test_crashes=False, test_pause=None):
+def serve(state, *, allow_test_crashes=False, test_pause=None, freshness_seconds=None):
     path = socket_path(state)
     with store.Journal(state) as journal:
         # The lifetime lock permits removing only our owned stale socket.
@@ -112,7 +227,7 @@ def serve(state, *, allow_test_crashes=False, test_pause=None):
             store.require(stat.S_ISSOCK(info.st_mode) and info.st_uid == os.geteuid()
                           and stat.S_IMODE(info.st_mode) == 0o600, "Unexpected object occupies the monitor socket path.")
             path.unlink()
-        service = Service(journal, allow_test_crashes, test_pause=test_pause)
+        service = Service(journal, allow_test_crashes, test_pause=test_pause, freshness_seconds=freshness_seconds)
         stopping = False
         def stop(signum, frame):
             nonlocal stopping
@@ -126,21 +241,26 @@ def serve(state, *, allow_test_crashes=False, test_pause=None):
                 info = path.lstat()
                 bound_identity = (info.st_dev, info.st_ino)
                 server.listen(8)
-                server.settimeout(0.2)
+                server.settimeout(TICK_SECONDS)
                 while not stopping:
+                    service.tick()
                     try:
                         connection, _ = server.accept()
                     except socket.timeout:
                         continue
                     with connection:
-                        connection.settimeout(3)
+                        connection.settimeout(IO_SECONDS)
+                        deadline = time.monotonic() + IO_SECONDS if freshness_seconds is not None else None
                         try:
-                            response = service.dispatch(receive(connection, store.MAX_REQUEST))
+                            response = service.dispatch(receive(connection, store.MAX_REQUEST,
+                                deadline=deadline, tick=service.tick if deadline is not None else None))
                             data = (store.encoded(response) + "\n").encode()
                             store.require(len(data) <= MAX_RESPONSE, "Response exceeds size limit.")
-                        except (ValueError, TypeError, KeyError, OSError, OverflowError):
+                        except (ValueError, TypeError, KeyError, OSError, OverflowError, store.sqlite3.Error):
                             data = b'{"ok":false,"error":"request_rejected"}\n'
                         try:
+                            if deadline is not None:
+                                connection.settimeout(max(0.001, deadline - time.monotonic()))
                             connection.sendall(data)
                         except OSError:
                             pass  # A committed observation survives a disconnected client.
@@ -162,6 +282,7 @@ def main():
     run = commands.add_parser("serve", help="Serve existing verified state only")
     run.add_argument("--state", required=True)
     run.add_argument("--allow-test-crashes", action="store_true")
+    run.add_argument("--freshness-seconds", type=float, help="Opt-in missing-data deadline (1 to 30 seconds)")
     args = parser.parse_args()
     try:
         if args.command == "init":
@@ -170,7 +291,7 @@ def main():
             result = store.initialize(args.state, store.parse(raw))
             print(store.encoded({"ok": True, "identity": result}))
         else:
-            serve(args.state, allow_test_crashes=args.allow_test_crashes)
+            serve(args.state, allow_test_crashes=args.allow_test_crashes, freshness_seconds=args.freshness_seconds)
     except (OSError, ValueError, TypeError, KeyError, OverflowError, store.sqlite3.Error):
         parser.exit(1, "Monitor service stopped: existing state or request could not be verified.\n")
 
