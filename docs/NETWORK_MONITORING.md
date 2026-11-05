@@ -66,11 +66,11 @@ Restoring the approved configuration can resolve rule drift while a forbidden-ac
 
 Missing telemetry, a counter reset, or an unrelated successful canary cannot silently clear unresolved network findings. Counter deltas across a coverage gap are unknown, rather than zero or negative. Complete current canary coverage is required before a healthy status is justified.
 
-The monitor samples at explicit points in this bounded exercise. It may miss a transient change introduced and removed between samples. This implementation does not subscribe to every kernel change event, supply a permanent monitoring daemon, guarantee detection latency, or deliver email/Slack/pager notifications. Its lifecycle state is scoped to one run; durable incident storage across monitor restarts is future work.
+The monitor samples at explicit points in this bounded exercise. It may miss a transient change introduced and removed between samples. This implementation does not subscribe to every kernel change event, supply a permanent monitoring daemon, guarantee detection latency, or deliver email/Slack/pager notifications. Its lifecycle state is scoped to one run. The separate [service-restart exercise](NETWORK_MONITOR_RESTART.md) adds a transactional journal and verifies recovery across actual supervised process restarts.
 
 ## Inspect the evidence
 
-Open **Actions → Verify project → network_lab**. Confirm all four network exercises and the final job passed, then download `network-monitoring-<commit>-<run ID>-<attempt>`. An earlier successful network artifact does not establish the monitoring result.
+Open **Actions → Verify project → network_lab**. Confirm all five network exercises and the final job passed, then download `network-monitoring-<commit>-<run ID>-<attempt>`. An earlier successful network artifact does not establish the monitoring result.
 
 | File | Review purpose |
 | --- | --- |

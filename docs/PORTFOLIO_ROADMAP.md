@@ -35,6 +35,8 @@ The [segmentation expansion](NETWORK_SEGMENTATION.md) adds user, application, an
 
 The [monitoring expansion](NETWORK_MONITORING.md) adds sampled rule comparison, blocked-packet observations, active connection checks, and alert lifecycles. Its disposable run exercises incorrect permits, incorrect denials, an explicitly simulated telemetry outage, and repair. This is run-scoped detection evidence; continuously deployed monitoring and external notification delivery remain separate future work.
 
+The [service-restart expansion](NETWORK_MONITOR_RESTART.md) adds a transactional monitoring journal and a transient Linux service. Its acceptance requires real process exits, supervisor restarts, preserved committed incidents, idempotent retries, and fresh recovery evidence. It does not establish VM reboot, physical power-loss, or production-operation behavior.
+
 ## Proposed stages
 
 | Planning window | Engineering work | Evidence required | What Fischer should be able to do |
