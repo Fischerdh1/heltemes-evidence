@@ -91,11 +91,27 @@ class Service:
         self.gap_committed_at_utc = None
         self.persistence_error = None
         self.outage_number = 0
-        self.base_elapsed = journal.rows[-1]["sample"]["elapsed_seconds"] if journal.rows else 0.0
+        last_row = self._last_row()
+        self.base_elapsed = last_row["sample"]["elapsed_seconds"] if last_row else 0.0
         # An accepted restart boundary is required before serving any request.
         journal.append("_restart_" + self.instance_id,
             {"phase": "monitor_restart", "observed_at_utc": utc_now(), "ruleset": None,
              "collection_error": "monitor_restarted", "probes": []}, self.base_elapsed, restart=True)
+
+    def _last_row(self):
+        if hasattr(self.journal, "last_row"):
+            return self.journal.last_row
+        return self.journal.rows[-1] if self.journal.rows else None
+
+    def _capacity_remaining(self):
+        if hasattr(self.journal, "capacity_remaining"):
+            return self.journal.capacity_remaining
+        return max(0, store.MAX_ROWS - len(self.journal.rows))
+
+    def _has_request(self, request_id):
+        if hasattr(self.journal, "has_request"):
+            return self.journal.has_request(request_id)
+        return any(row["request_id"] == request_id for row in self.journal.rows)
 
     def _age(self):
         if self.last_accepted is None:
@@ -107,7 +123,7 @@ class Service:
         """Commit a missing-data boundary even while no caller asks for status."""
         if self.freshness_seconds is None:
             return
-        if len(self.journal.rows) >= store.MAX_ROWS:
+        if self._capacity_remaining() == 0:
             self.persistence_error = self.persistence_error or "journal_capacity_exhausted"
         if self.persistence_error or self.gap_attempted or self._age() < self.freshness_seconds:
             return
@@ -124,7 +140,7 @@ class Service:
             return
         self.gap_sequence = result["committed_sequence"]
         self.gap_committed_at_utc = utc_now()
-        if len(self.journal.rows) >= store.MAX_ROWS:
+        if self._capacity_remaining() == 0:
             self.persistence_error = "journal_capacity_exhausted"
 
     def status(self):
@@ -148,7 +164,7 @@ class Service:
                 + self.freshness_seconds, timezone.utc).isoformat(),
             "expired": expired, "gap_recorded": self.gap_sequence is not None,
             "gap_sequence": self.gap_sequence, "gap_committed_at_utc": self.gap_committed_at_utc,
-            "capacity_remaining": max(0, store.MAX_ROWS - len(self.journal.rows)),
+            "capacity_remaining": self._capacity_remaining(),
             "persistence_error": self.persistence_error,
         }
         if self.last_accepted is None or expired or self.persistence_error:
@@ -180,7 +196,7 @@ class Service:
         store.require("test_pause" not in payload or (self.test_pause is not None and pause in CRASH_CODES),
                       "Test pause is disabled or invalid.")
         source_time, source_age, received, received_monotonic = None, None, None, None
-        duplicate = any(row["request_id"] == payload["request_id"] for row in self.journal.rows)
+        duplicate = self._has_request(payload["request_id"])
         if self.freshness_seconds is not None and not duplicate:
             self.journal._validate_observation(payload["observation"])
             store.require(isinstance(payload["request_id"], str)
@@ -193,7 +209,7 @@ class Service:
             store.require(0 <= source_age < self.freshness_seconds, "Source timestamp is stale or in the future.")
             store.require(self.last_accepted is None or source_time > self.last_accepted["source_timestamp"],
                           "Source timestamp does not advance the last accepted fresh observation.")
-            store.require(source_time >= store.monitor.utc(self.journal.rows[-1]["sample"]["observed_at_utc"]),
+            store.require(source_time >= store.monitor.utc(self._last_row()["sample"]["observed_at_utc"]),
                           "Source timestamp precedes the latest committed observation boundary.")
         def fault(current):
             if current == point:
@@ -218,9 +234,16 @@ class Service:
         return {"ok": True, **result, "result_is_historical": result["duplicate"], "current_status": self.status()}
 
 
-def serve(state, *, allow_test_crashes=False, test_pause=None, freshness_seconds=None):
+def serve(state, *, allow_test_crashes=False, test_pause=None, freshness_seconds=None,
+          archive_history=False, journal_factory=None):
     path = socket_path(state)
-    with store.Journal(state) as journal:
+    if journal_factory is None:
+        if archive_history:
+            from scripts.network_monitor_archive import ArchiveJournal
+            journal_factory = ArchiveJournal
+        else:
+            journal_factory = store.Journal
+    with journal_factory(state) as journal:
         # The lifetime lock permits removing only our owned stale socket.
         if path.exists() or path.is_symlink():
             info = path.lstat()
@@ -279,19 +302,31 @@ def main():
     create = commands.add_parser("init", help="Explicitly initialize new disposable state")
     create.add_argument("--state", required=True)
     create.add_argument("--approved", required=True)
+    create.add_argument("--archive-history", action="store_true", help="Explicit new archive journal format")
+    create.add_argument("--segment-rows", type=int, default=256)
+    create.add_argument("--max-history-rows", type=int, default=4096)
     run = commands.add_parser("serve", help="Serve existing verified state only")
     run.add_argument("--state", required=True)
     run.add_argument("--allow-test-crashes", action="store_true")
     run.add_argument("--freshness-seconds", type=float, help="Opt-in missing-data deadline (1 to 30 seconds)")
+    run.add_argument("--archive-history", action="store_true")
     args = parser.parse_args()
     try:
         if args.command == "init":
             raw = Path(args.approved).read_bytes()
             store.require(len(raw) <= store.MAX_REQUEST, "Approved input exceeds size limit.")
-            result = store.initialize(args.state, store.parse(raw))
+            if args.archive_history:
+                from scripts.network_monitor_archive import initialize
+                result = initialize(args.state, store.parse(raw), segment_rows=args.segment_rows,
+                                    max_rows=args.max_history_rows)
+            else:
+                store.require(args.segment_rows == 256 and args.max_history_rows == 4096,
+                              "Archive budget options require explicit archive history mode.")
+                result = store.initialize(args.state, store.parse(raw))
             print(store.encoded({"ok": True, "identity": result}))
         else:
-            serve(args.state, allow_test_crashes=args.allow_test_crashes, freshness_seconds=args.freshness_seconds)
+            serve(args.state, allow_test_crashes=args.allow_test_crashes, freshness_seconds=args.freshness_seconds,
+                  archive_history=args.archive_history)
     except (OSError, ValueError, TypeError, KeyError, OverflowError, store.sqlite3.Error):
         parser.exit(1, "Monitor service stopped: existing state or request could not be verified.\n")
 

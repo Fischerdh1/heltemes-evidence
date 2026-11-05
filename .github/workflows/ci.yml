@@ -384,9 +384,61 @@ jobs:
           cat work/monitor-automatic/publish/SUMMARY.md >> "$GITHUB_STEP_SUMMARY"
           printf '\n[Download automatic monitoring evidence](%s)\n' "$ARTIFACT_URL" >> "$GITHUB_STEP_SUMMARY"
 
+  monitor_archive:
+    needs: [python]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@e797f83bcb11b83ae66e0230d6156d7c80228e7c # v6.0.0
+        with:
+          python-version: '3.14'
+      - name: Install disposable guest VM tools
+        run: |
+          sudo apt-get update
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y qemu-system-x86 qemu-utils cloud-image-utils openssh-client curl
+      - name: Exercise history archiving and crash recovery
+        env:
+          REVIEWER_PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          mkdir -p work
+          python3 -I -S -B scripts/network_monitor_archive_vm.py --output work/monitor-archive
+      - name: Retain archived monitoring evidence
+        id: archive_evidence
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: monitor-archive-${{ github.sha }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            work/monitor-archive/publish/REPORT.json
+            work/monitor-archive/publish/VM.json
+            work/monitor-archive/publish/SUMMARY.md
+            work/monitor-archive/publish/MANIFEST.json
+            work/monitor-archive/publish/GUEST.json
+            work/monitor-archive/publish/APPROVED_POLICY.json
+            work/monitor-archive/publish/monitor.service
+            work/monitor-archive/publish/collector.service
+            work/monitor-archive/publish/user.pcap
+            work/monitor-archive/publish/user-packets.txt
+            work/monitor-archive/publish/app.pcap
+            work/monitor-archive/publish/app-packets.txt
+            work/monitor-archive/publish/management.pcap
+            work/monitor-archive/publish/management-packets.txt
+            work/monitor-archive/publish/archive-segment-000001.json
+            work/monitor-archive/publish/archive-segment-000002.json
+          if-no-files-found: error
+          retention-days: 30
+      - name: Show history archive results
+        env:
+          ARTIFACT_URL: ${{ steps.archive_evidence.outputs.artifact-url }}
+        run: |
+          cat work/monitor-archive/publish/SUMMARY.md >> "$GITHUB_STEP_SUMMARY"
+          printf '\n[Download archive monitoring evidence](%s)\n' "$ARTIFACT_URL" >> "$GITHUB_STEP_SUMMARY"
+
   reviewer:
     if: ${{ always() }}
-    needs: [python, terraform, network_lab, monitor_reboot, monitor_powercut, monitor_automatic]
+    needs: [python, terraform, network_lab, monitor_reboot, monitor_powercut, monitor_automatic, monitor_archive]
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
@@ -397,9 +449,9 @@ jobs:
           python3 - <<'PY'
           import json, os
           results = json.loads(os.environ['PREREQUISITE_RESULTS'])
-          expected = {'python', 'terraform', 'network_lab', 'monitor_reboot', 'monitor_powercut', 'monitor_automatic'}
+          expected = {'python', 'terraform', 'network_lab', 'monitor_reboot', 'monitor_powercut', 'monitor_automatic', 'monitor_archive'}
           if set(results) != expected or any(value.get('result') != 'success' for value in results.values()):
-              raise SystemExit('Reviewer blocked: every prerequisite, including VM reboot, abrupt virtual power loss, and automatic missing-data recovery, must succeed.')
+              raise SystemExit('Reviewer blocked: every prerequisite, including VM reboot, abrupt virtual power loss, automatic missing-data recovery, and history archiving, must succeed.')
           PY
       - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
         with:
