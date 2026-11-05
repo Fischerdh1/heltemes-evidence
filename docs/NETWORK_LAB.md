@@ -4,7 +4,7 @@ This lab adds a network-security case study to HELTEMES Evidence. It creates thr
 
 The lab operates inside a disposable Linux VM and uses synthetic content. It does not require administrator changes on the personal Mac or access to the real filing archive, signing key, or accepted trust history.
 
-The acceptance criteria below describe the intended checks. A particular result is established by its completed `network_lab` job and downloaded report. The implementation is awaiting its first hosted acceptance run as of November 4, 2026.
+The acceptance criteria below describe the required checks. A particular result is established by its completed `network_lab` job and inspection of the downloaded report. The [implementation and validation record](https://github.com/Fischerdh1/heltemes-evidence/pull/8) links the hosted runs and records the artifact review.
 
 ## Topology and policy
 
@@ -30,11 +30,16 @@ The intended forwarding policy permits the client to reach TCP 8080 on the synth
 | Denied traffic | A fresh client request to TCP 9090 times out, the matching router drop counter increases, and a server-local probe confirms the listener is healthy | The observed denial agrees with the firewall decision and an available destination service |
 | Injected mistake | An intentionally added permit rule makes TCP 9090 reachable, and the expected-denial check detects that policy violation | The check can identify a permissive regression |
 | Repair | The restricted rule set is restored, TCP 9090 is denied again, its drop counter increases, and TCP 8080 succeeds | The repair restores the required allowed and denied behavior |
+| Packet evidence | Every recorded client probe appears in the capture; successful probes have a server handshake and payload, denied probes have no captured server reply | The saved capture covers the tested connections, including the final repaired connection |
 | Cleanup | Capture and service processes stop, and the namespaces and virtual links created by the run are removed | The completed run releases its temporary resources |
 
 Each probe uses a fresh TCP connection so an earlier established connection cannot stand in for the new policy decision. A timeout alone is ambiguous because a stopped service or broken route can cause a similar symptom. The healthy-listener probe, successful allowed request, and drop-counter increase give the denial a specific explanation.
 
 The injected permit rule is a controlled experiment. A successful run records that the expected-denial check detected it, then verifies the repaired policy. An unexpected probe result, source mismatch, failed capture, or incomplete cleanup stops successful artifact publication.
+
+### Why packet validation is required
+
+In the [first hosted run](https://github.com/Fischerdh1/heltemes-evidence/actions/runs/41976408046), the traffic checks passed, but independent inspection found that the saved 51-packet capture omitted the final repaired TCP 8080 connection. The capture had stopped before buffered delivery finished. That green job was not accepted as complete packet evidence. The script now requests immediate delivery, waits for evidence for every client probe, and validates the closed capture again. Regression checks cover a missing final flow, malformed or unrelated packets, and a capture that never becomes complete. The original downloaded artifact is retained locally as a failing example. This illustrates why a passing traffic check and a complete saved record are separate requirements.
 
 ## Inspect the hosted result
 
@@ -54,7 +59,7 @@ The report is intended to contain these fixed evidence files:
 | `misconfigured-policy.nft` | The deliberate permit-rule mistake used by the detector check |
 | `SUMMARY.md` | A readable explanation of the observed run |
 
-The capture process is stopped and awaited before the capture is read and hashed. Capture is scoped to the router's client-facing `lan0` interface and filtered to the exact client/server IPv4 addresses and TCP ports 8080/9090. The seven evidence files are published under the requested output directory's `publish` folder only after the checks and cleanup succeed. Compare the manifest with the downloaded files, then inspect the packet observations alongside the firewall counters. The manifest provides a consistency reference whose trust depends on its source and custody.
+Capture is scoped to the router's client-facing `lan0` interface and filtered to the exact client/server IPv4 addresses and TCP ports 8080/9090. Immediate delivery is requested, and the script waits up to five seconds for packet evidence for every recorded client probe before stopping capture. It then waits for the process to exit and validates the final PCAP again before hashing it. Malformed records, unrelated flows, or missing probe evidence fail the run. The seven evidence files are published under the requested output directory's `publish` folder only after the checks and cleanup succeed. Compare the manifest with the downloaded files, then inspect the per-flow packet observations alongside the firewall counters. The manifest provides a consistency reference whose trust depends on its source and custody. [tcpdump immediate delivery](https://raw.githubusercontent.com/the-tcpdump-group/tcpdump/master/tcpdump.1.in)
 
 Artifacts expire after the configured retention period or may be removed earlier by repository administration. Select a separately checked release when preserving a longer-lived portfolio milestone. [Workflow artifact retention](https://docs.github.com/en/actions/tutorials/store-and-share-data)
 

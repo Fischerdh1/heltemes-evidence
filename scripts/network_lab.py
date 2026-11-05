@@ -10,6 +10,8 @@ from pathlib import Path
 import secrets
 import shutil
 import signal
+import socket
+import struct
 import subprocess
 import sys
 import time
@@ -145,6 +147,87 @@ def require_denied(probe, healthy, before, after):
     require(after > before, "The router's forbidden-port drop counter did not increase.")
 
 
+class CaptureIncomplete(RuntimeError):
+    """The running capture may still be delivering the required packet records."""
+
+
+def pcap_packets(raw):
+    """Read bounded Ethernet/IPv4/TCP classic PCAP; reject other traffic or formats."""
+    require(len(raw) < 4 * 1024 * 1024, "Packet capture exceeds its bound.")
+    if len(raw) < 24:
+        raise CaptureIncomplete("Packet capture header is incomplete.")
+    formats = {b"\xd4\xc3\xb2\xa1": ("<", 1_000_000), b"\xa1\xb2\xc3\xd4": (">", 1_000_000),
+               b"\x4d\x3c\xb2\xa1": ("<", 1_000_000_000), b"\xa1\xb2\x3c\x4d": (">", 1_000_000_000)}
+    require(raw[:4] in formats, "Packet capture has an unsupported magic value.")
+    endian, precision = formats[raw[:4]]
+    major, minor, zone, accuracy, snaplen, link_type = struct.unpack(endian + "HHiIII", raw[4:24])
+    require((major, minor, snaplen, link_type) == (2, 4, 512, 1), "Packet capture format or interface type is unexpected.")
+    position, packets = 24, []
+    while position < len(raw):
+        if len(raw) - position < 16:
+            raise CaptureIncomplete("Packet capture record header is incomplete.")
+        seconds, fraction, size, original = struct.unpack(endian + "IIII", raw[position:position + 16])
+        require(fraction < precision and 54 <= size <= 512 and size <= original <= 65549,
+                "Packet capture record lengths or timestamp are malformed.")
+        position += 16
+        if len(raw) - position < size:
+            raise CaptureIncomplete("Packet capture record body is incomplete.")
+        frame = raw[position:position + size]
+        position += size
+        require(frame[12:14] == b"\x08\x00", "Packet capture contains non-IPv4 traffic.")
+        ip = frame[14:]
+        header = (ip[0] & 15) * 4
+        total = struct.unpack("!H", ip[2:4])[0]
+        fragment = struct.unpack("!H", ip[6:8])[0]
+        require(ip[0] >> 4 == 4 and header >= 20 and len(ip) >= header + 20
+                and header + 20 <= total <= original - 14 and fragment & 0x3fff == 0 and ip[9] == 6,
+                "Packet capture contains malformed, fragmented, or non-TCP IPv4 traffic.")
+        source, destination = socket.inet_ntoa(ip[12:16]), socket.inet_ntoa(ip[16:20])
+        require({source, destination} == {CLIENT, SERVER}, "Packet capture contains an out-of-scope IP address.")
+        tcp = ip[header:]
+        source_port, destination_port = struct.unpack("!HH", tcp[:4])
+        tcp_header = (tcp[12] >> 4) * 4
+        require(20 <= tcp_header <= len(tcp) and header + tcp_header <= total,
+                "Packet capture contains a malformed TCP header.")
+        service_port = destination_port if source == CLIENT else source_port
+        require(service_port in (8080, 9090), "Packet capture contains an out-of-scope service port.")
+        packets.append({"source": source, "destination": destination, "source_port": source_port,
+                        "destination_port": destination_port, "flags": tcp[13],
+                        "payload_bytes": min(total - header, len(tcp)) - tcp_header})
+    return packets
+
+
+def validate_capture(raw, probes):
+    packets = pcap_packets(raw)
+    clients = [probe for probe in probes if probe["from"] == "client"]
+    expected = {(probe["source_port"], probe["port"]): probe for probe in clients}
+    require(bool(clients) and len(expected) == len(clients)
+            and len({probe["source_port"] for probe in clients}) == len(clients),
+            "Capture verification requires distinct recorded client probe ports.")
+    flows = {key: {"outgoing": [], "incoming": []} for key in expected}
+    for packet in packets:
+        outgoing = packet["source"] == CLIENT
+        key = ((packet["source_port"], packet["destination_port"]) if outgoing
+               else (packet["destination_port"], packet["source_port"]))
+        require(key in expected, "Packet capture contains a flow outside the recorded client probes.")
+        flows[key]["outgoing" if outgoing else "incoming"].append(packet)
+    summary = []
+    for key, probe in expected.items():
+        outgoing, incoming = flows[key]["outgoing"], flows[key]["incoming"]
+        if not any(packet["flags"] & 0x12 == 0x02 for packet in outgoing):
+            raise CaptureIncomplete(f"Capture lacks the outgoing SYN for {probe['phase']} TCP{probe['port']} source {probe['source_port']}.")
+        require(probe["outcome"] in ("response", "timeout"), "Capture cannot validate an unsuccessful probe outcome.")
+        if probe["outcome"] == "timeout":
+            require(not incoming, "A denied probe has incoming server packets in the capture.")
+        elif not (any(packet["flags"] & 0x12 == 0x12 for packet in incoming)
+                  and any(packet["payload_bytes"] > 0 for packet in incoming)):
+            raise CaptureIncomplete(f"Capture lacks the server handshake or payload for {probe['phase']} TCP{probe['port']} source {probe['source_port']}.")
+        summary.append({"phase": probe["phase"], "port": probe["port"], "source_port": probe["source_port"],
+                        "outcome": probe["outcome"], "outgoing_packets": len(outgoing), "incoming_packets": len(incoming),
+                        "incoming_payload_bytes": sum(packet["payload_bytes"] for packet in incoming)})
+    return {"ok": True, "packet_count": len(packets), "client_flows_verified": len(summary), "flows": summary}
+
+
 class NamespaceLab:
     def __init__(self, tools, staging):
         self.tools = tools
@@ -231,7 +314,7 @@ class NamespaceLab:
         packet_file = (self.staging / "packet-capture.pcap").open("wb", buffering=0)
         errors = (self.staging / "capture.stderr").open("wb", buffering=0)
         self.handles.extend((packet_file, errors))
-        arguments = [self.tools["tcpdump"], "-n", "-i", "lan0", "-U", "-s", "512", "-c", "2000", "-w", "-", CAPTURE_FILTER]
+        arguments = [self.tools["tcpdump"], "-n", "-i", "lan0", "--immediate-mode", "-U", "-s", "512", "-c", "2000", "-w", "-", CAPTURE_FILTER]
         self.capture = subprocess.Popen(self.namespace_command("router", arguments), stdout=packet_file, stderr=errors)
         self.processes.append(self.capture)
         for _ in range(50):
@@ -252,15 +335,24 @@ class NamespaceLab:
         return counters
 
     def stop_capture(self):
-        require(self.capture is not None and self.capture.poll() is None, "Capture ended unexpectedly during the exercise.")
+        deadline = time.monotonic() + 5
+        while True:
+            require(self.capture is not None and self.capture.poll() is None, "Capture ended unexpectedly during the exercise.")
+            try:
+                validate_capture((self.staging / "packet-capture.pcap").read_bytes(), self.probes)
+                break
+            except CaptureIncomplete as error:
+                require(time.monotonic() < deadline, "Capture delivery deadline expired: " + str(error))
+                time.sleep(0.05)
         self.capture.send_signal(signal.SIGINT)
         require(self.capture.wait(timeout=10) == 0, "Packet capture did not close successfully.")
         raw = (self.staging / "packet-capture.pcap").read_bytes()
-        require(24 < len(raw) < 4 * 1024 * 1024, "Packet capture is empty or exceeds its bound.")
+        verification = validate_capture(raw, self.probes)
         decoded = self.command([self.tools["tcpdump"], "-nn", "-tt", "-r", str(self.staging / "packet-capture.pcap")]).stdout
         require(CLIENT in decoded and SERVER in decoded and ".8080" in decoded and ".9090" in decoded,
                 "Packet capture lacks the expected synthetic traffic.")
         (self.staging / "packet-capture.txt").write_text(decoded)
+        return verification
 
     def cleanup(self):
         errors = []
@@ -332,8 +424,8 @@ def run_exercise(lab):
     repaired = lab.counters()
     require_denied(repaired_denied, repaired_healthy, repaired_before["denied_9090"], repaired["denied_9090"])
     require(successful_response(repaired_allowed, 8080), "The repaired policy blocked required traffic.")
-    lab.stop_capture()
-    return {"baseline": baseline, "protected": {"allowed": allowed, "denied": denied, "service_health": healthy,
+    capture = lab.stop_capture()
+    return {"capture_verification": capture, "baseline": baseline, "protected": {"allowed": allowed, "denied": denied, "service_health": healthy,
             "counters_before": before, "counters_after": protected},
             "injected_misconfiguration": {"detected": True, "expected_policy_violation": True,
             "observed_policy_violation": True, "unexpected_response": unexpected, "counters": misconfigured},

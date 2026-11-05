@@ -2,6 +2,8 @@
 import hashlib
 import json
 from pathlib import Path
+import socket
+import struct
 import subprocess
 import tempfile
 import unittest
@@ -16,6 +18,38 @@ TOOLS = {name: "/tools/" + name for name in ("ip", "nft", "tcpdump", "sysctl", "
 def response(port):
     return {"outcome": "response", "status": 200,
             "payload": {"synthetic": True, "service_port": port}}
+
+
+def packet(source_port, service_port, *, incoming=False, flags=0x02, payload=b"", source_ip=None):
+    """Construct inert Ethernet/IPv4/TCP bytes; never opens a network socket."""
+    source, destination = (lab.SERVER, lab.CLIENT) if incoming else (lab.CLIENT, lab.SERVER)
+    ports = (service_port, source_port) if incoming else (source_port, service_port)
+    tcp = struct.pack("!HHIIBBHHH", *ports, 0, 0, 0x50, flags, 65535, 0, 0) + payload
+    ip = struct.pack("!BBHHHBBH4s4s", 0x45, 0, 20 + len(tcp), 0, 0, 64, 6, 0,
+                     socket.inet_aton(source_ip or source), socket.inet_aton(destination))
+    return b"\x00" * 12 + b"\x08\x00" + ip + tcp
+
+
+def pcap(frames):
+    return (b"\xd4\xc3\xb2\xa1" + struct.pack("<HHiIII", 2, 4, 0, 0, 512, 1)
+            + b"".join(struct.pack("<IIII", 1, 0, len(frame), len(frame)) + frame for frame in frames))
+
+
+def capture_fixture():
+    specs = (("baseline", 8080, "response"), ("baseline", 9090, "response"),
+             ("protected", 8080, "response"), ("protected", 9090, "timeout"),
+             ("misconfigured", 9090, "response"), ("repaired", 9090, "timeout"),
+             ("repaired", 8080, "response"))
+    probes, frames = [], []
+    for index, (phase, port, outcome) in enumerate(specs):
+        source_port = 40000 + index
+        probes.append({"from": "client", "phase": phase, "port": port,
+                       "source_port": source_port, "outcome": outcome})
+        frames.append(packet(source_port, port))
+        if outcome == "response":
+            frames.append(packet(source_port, port, incoming=True, flags=0x12))
+            frames.append(packet(source_port, port, incoming=True, flags=0x18, payload=b"synthetic HTTP response"))
+    return probes, frames
 
 
 class ExerciseFixture:
@@ -196,9 +230,10 @@ class NetworkLabTests(unittest.TestCase):
         process = Mock()
         process.poll.return_value = None
         process.wait.return_value = 0
+        instance.probes, frames = capture_fixture()
         def spawn(arguments, **options):
             options["stderr"].write(b"listening on lan0\n")
-            options["stdout"].write(b"synthetic-test-pcap-placeholder" * 2)
+            options["stdout"].write(pcap(frames))
             return process
         try:
             with patch.object(lab.subprocess, "Popen", side_effect=spawn) as popen:
@@ -206,13 +241,15 @@ class NetworkLabTests(unittest.TestCase):
             arguments = popen.call_args.args[0]
             self.assertEqual(arguments[:4], [TOOLS["ip"], "netns", "exec", instance.names["router"]])
             self.assertEqual(arguments[-1], lab.CAPTURE_FILTER)
+            self.assertIn("--immediate-mode", arguments)
             self.assertEqual(arguments[arguments.index("-i") + 1], "lan0")
             self.assertEqual(arguments[arguments.index("-w") + 1], "-")
             def decode(arguments, **options):
                 process.wait.assert_called_once_with(timeout=10)
                 return subprocess.CompletedProcess(arguments, 0, f"{lab.CLIENT}.40001 > {lab.SERVER}.8080\n{lab.CLIENT}.40002 > {lab.SERVER}.9090\n", "")
             with patch.object(instance, "command", side_effect=decode):
-                instance.stop_capture()
+                verification = instance.stop_capture()
+            self.assertEqual(verification["client_flows_verified"], 7)
             self.assertTrue((self.base / "packet-capture.txt").is_file())
         finally:
             for handle in instance.handles:
@@ -224,6 +261,60 @@ class NetworkLabTests(unittest.TestCase):
         instance.capture.poll.return_value = 0
         with self.assertRaisesRegex(RuntimeError, "unexpectedly"):
             instance.stop_capture()
+
+    def test_capture_validation_requires_every_flow_including_final_repair(self):
+        probes, frames = capture_fixture()
+        verification = lab.validate_capture(pcap(frames), probes)
+        self.assertEqual(verification["client_flows_verified"], 7)
+        self.assertEqual(verification["flows"][-1]["phase"], "repaired")
+        self.assertEqual(verification["flows"][-1]["source_port"], 40006)
+        with self.assertRaisesRegex(lab.CaptureIncomplete, "repaired TCP8080 source 40006"):
+            lab.validate_capture(pcap(frames[:-3]), probes)
+        with self.assertRaisesRegex(lab.CaptureIncomplete, "handshake or payload"):
+            lab.validate_capture(pcap(frames[:-1]), probes)
+        denied_index = next(i for i, frame in enumerate(frames) if struct.unpack("!HH", frame[34:38]) == (40005, 9090))
+        with self.assertRaisesRegex(lab.CaptureIncomplete, "repaired TCP9090 source 40005"):
+            lab.validate_capture(pcap(frames[:denied_index] + frames[denied_index + 1:]), probes)
+
+    def test_capture_wait_is_bounded_and_does_not_stop_before_final_flow(self):
+        instance = self.make_lab()
+        instance.probes, frames = capture_fixture()
+        (self.base / "packet-capture.pcap").write_bytes(pcap(frames[:-3]))
+        instance.capture = Mock()
+        instance.capture.poll.return_value = None
+        with patch.object(lab.time, "monotonic", side_effect=[0, 6]):
+            with self.assertRaisesRegex(RuntimeError, "delivery deadline.*repaired TCP8080"):
+                instance.stop_capture()
+        instance.capture.send_signal.assert_not_called()
+
+    def test_capture_wait_observes_late_records_then_revalidates_closed_file(self):
+        instance = self.make_lab()
+        instance.probes, frames = capture_fixture()
+        capture = self.base / "packet-capture.pcap"
+        capture.write_bytes(pcap(frames[:-3]))
+        instance.capture = Mock()
+        instance.capture.poll.return_value = None
+        def finish(**options):
+            capture.write_bytes(pcap(frames[:-3]))
+            return 0
+        instance.capture.wait.side_effect = finish
+        with patch.object(lab.time, "sleep", side_effect=lambda duration: capture.write_bytes(pcap(frames))):
+            with self.assertRaisesRegex(lab.CaptureIncomplete, "repaired TCP8080"):
+                instance.stop_capture()
+        instance.capture.send_signal.assert_called_once()
+        instance.capture.wait.assert_called_once_with(timeout=10)
+
+    def test_capture_rejects_out_of_scope_malformed_and_denied_return_packets(self):
+        probes, frames = capture_fixture()
+        invalid = (pcap(frames + [packet(40000, 8080, source_ip="192.0.2.1")]),
+                   pcap(frames + [packet(40000, 443)]),
+                   pcap(frames + [packet(49999, 8080)]),
+                   pcap(frames + [packet(40005, 9090, incoming=True, flags=0x14)]),
+                   b"INVALID" + pcap(frames)[7:], pcap(frames)[:-1],
+                   pcap(frames) + b"\x00", pcap([b"\x00" * 54]))
+        for value in invalid:
+            with self.subTest(length=len(value)), self.assertRaises(RuntimeError):
+                lab.validate_capture(value, probes)
 
     def test_source_identity_rejects_modified_code_and_wrong_ci_commit(self):
         root = self.base / "source"
