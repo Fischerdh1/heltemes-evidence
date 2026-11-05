@@ -33,6 +33,8 @@ The [DNS and TLS expansion](NETWORK_SERVICES_LAB.md) adds explicit name resoluti
 
 The [segmentation expansion](NETWORK_SEGMENTATION.md) adds user, application, and management networks with a twelve-case access matrix. It verifies scoped return traffic, denied new connections, a deliberately permissive exception, repair, and packet observations on both sides of the router. Its acceptance is tied to the particular hosted run and inspected artifact.
 
+The [monitoring expansion](NETWORK_MONITORING.md) adds sampled rule comparison, blocked-packet observations, active connection checks, and alert lifecycles. Its disposable run exercises incorrect permits, incorrect denials, an explicitly simulated telemetry outage, and repair. This is run-scoped detection evidence; continuously deployed monitoring and external notification delivery remain separate future work.
+
 ## Proposed stages
 
 | Planning window | Engineering work | Evidence required | What Fischer should be able to do |

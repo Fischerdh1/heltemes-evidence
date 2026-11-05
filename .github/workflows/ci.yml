@@ -147,6 +147,43 @@ jobs:
           cat work/network-segmentation/publish/SUMMARY.md >> "$GITHUB_STEP_SUMMARY"
           printf '\n[Download segmentation evidence](%s)\n' "$ARTIFACT_URL" >> "$GITHUB_STEP_SUMMARY"
 
+      - name: Exercise monitoring and alert recovery
+        env:
+          REVIEWER_PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          sudo -n --preserve-env=GITHUB_ACTIONS,GITHUB_SHA,GITHUB_EVENT_NAME,GITHUB_REPOSITORY,GITHUB_RUN_ID,GITHUB_RUN_ATTEMPT,GITHUB_SERVER_URL,REVIEWER_PR_HEAD_SHA \
+            "$(command -v python3)" -I -S -B scripts/network_monitoring_lab.py --output work/network-monitoring
+      - name: Retain monitoring evidence
+        id: monitoring_evidence
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: network-monitoring-${{ github.sha }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            work/network-monitoring/publish/REPORT.json
+            work/network-monitoring/publish/MANIFEST.json
+            work/network-monitoring/publish/APPROVED_POLICY.json
+            work/network-monitoring/publish/SNAPSHOTS.json
+            work/network-monitoring/publish/EVALUATIONS.json
+            work/network-monitoring/publish/ALERTS.json
+            work/network-monitoring/publish/EVENTS.jsonl
+            work/network-monitoring/publish/SUMMARY.md
+            work/network-monitoring/publish/policy.nft
+            work/network-monitoring/publish/overblocked-policy.nft
+            work/network-monitoring/publish/user.pcap
+            work/network-monitoring/publish/user-packets.txt
+            work/network-monitoring/publish/app.pcap
+            work/network-monitoring/publish/app-packets.txt
+            work/network-monitoring/publish/management.pcap
+            work/network-monitoring/publish/management-packets.txt
+          if-no-files-found: error
+          retention-days: 30
+      - name: Show monitoring results
+        env:
+          ARTIFACT_URL: ${{ steps.monitoring_evidence.outputs.artifact-url }}
+        run: |
+          cat work/network-monitoring/publish/SUMMARY.md >> "$GITHUB_STEP_SUMMARY"
+          printf '\n[Download monitoring evidence](%s)\n' "$ARTIFACT_URL" >> "$GITHUB_STEP_SUMMARY"
+
   reviewer:
     needs: [python, terraform, network_lab]
     runs-on: ubuntu-latest
