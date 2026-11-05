@@ -85,12 +85,61 @@ def cloud_configuration(token, client_public, host_private, host_public):
     return {
         "users": [{"name": "lab", "groups": "sudo", "shell": "/bin/bash", "lock_passwd": True,
                    "sudo": "ALL=(ALL) NOPASSWD:ALL", "ssh_authorized_keys": [client_public.strip()]}],
-        "disable_root": True, "ssh_pwauth": False, "ssh_deletekeys": True, "ssh_genkeytypes": [],
+        "disable_root": True, "ssh_pwauth": False, "ssh_deletekeys": True,
         "ssh_keys": {"ed25519_private": host_private, "ed25519_public": host_public.strip()},
         "package_update": True, "packages": ["python3", "git", "iproute2", "nftables", "tcpdump", "procps"],
         "write_files": [{"path": "/etc/heltemes-reboot-lab.json", "owner": "root:root", "permissions": "0600",
                          "content": json.dumps({"format": "heltemes-disposable-reboot-vm", "version": 1, "token": token}) + "\n"}],
     }
+
+
+
+def progress(message):
+    print("VM reboot lab: " + message, file=sys.stderr, flush=True)
+
+
+def cloud_init_status(result, redact):
+    """Require clean completion; retain bounded selected diagnostics on failure."""
+    require(len(result.stdout) <= 1024 * 1024, "Cloud-init status output exceeds its bound.")
+    try:
+        value = json.loads(result.stdout)
+    except (ValueError, UnicodeError) as error:
+        raise RuntimeError("Cloud-init returned malformed structured status; exit " + str(result.returncode)) from error
+    require(isinstance(value, dict), "Cloud-init status must be an object.")
+    def safe(message):
+        require(isinstance(message, str), "Cloud-init diagnostic message has an invalid type.")
+        text = redact(message)
+        text = re.sub(r"-----BEGIN [A-Z ]*PRIVATE KEY-----.*", "<private-key-omitted>", text, flags=re.S)
+        text = re.sub(r"(?:ssh-ed25519|ssh-rsa|ecdsa-[^ ]+) [A-Za-z0-9+/=]+", "<ssh-key-omitted>", text)
+        return text.replace("\n", " ")[:400]
+    def errors(section):
+        fatal, recoverable = section.get("errors", []), section.get("recoverable_errors", {})
+        require(isinstance(fatal, list) and isinstance(recoverable, dict)
+                and all(isinstance(key, str) and isinstance(items, list) for key, items in recoverable.items()),
+                "Cloud-init diagnostic collections have invalid types.")
+        for message in fatal:
+            require(isinstance(message, str), "Cloud-init error has an invalid type.")
+        for items in recoverable.values():
+            require(all(isinstance(message, str) for message in items), "Cloud-init recoverable error has an invalid type.")
+        return {"errors": [safe(message) for message in fatal[:4]],
+                "recoverable_errors": {safe(key): [safe(message) for message in items[:4]]
+                                       for key, items in list(recoverable.items())[:4]}}, bool(fatal or any(recoverable.values()))
+    selected, has_errors = errors(value)
+    selected.update({key: safe(value.get(key, "missing")) for key in ("status", "extended_status", "boot_status_code")})
+    selected["exit_code"] = result.returncode
+    stages = {}
+    for name in ("init-local", "init", "modules-config", "modules-final"):
+        if name in value:
+            require(isinstance(value[name], dict), "Cloud-init stage diagnostics have invalid types.")
+            detail, failed = errors(value[name])
+            has_errors = has_errors or failed
+            if failed:
+                stages[name] = detail
+    if stages:
+        selected["stages"] = stages
+    require(result.returncode == 0 and value.get("status") == "done" and value.get("extended_status") == "done"
+            and not has_errors, "Cloud-init did not complete cleanly: " + json.dumps(selected, sort_keys=True))
+    return selected
 
 
 class QMP:
@@ -223,7 +272,10 @@ class DisposableVM:
         self.kvm_status = self.qmp.command("query-kvm")
         require(self.kvm_status.get("enabled") is (self.accelerator == "kvm"), "QEMU acceleration differs from the selected mode.")
         self.wait_boot(timeout=360)
-        self.ssh("sudo -n cloud-init status --wait", timeout=360)
+        progress("guest SSH ready; waiting for clean cloud-init completion")
+        result = self.ssh("sudo -n cloud-init status --wait --format json", timeout=360, check=False)
+        self.cloud_init = cloud_init_status(result, self.redact)
+        progress("cloud-init completed cleanly; installing the allowlisted lab source")
         self.ssh("sudo -n mkdir -p " + GUEST_ROOT + " && sudo -n tar -xz --no-same-owner -f - -C " + GUEST_ROOT,
                  input=source_archive(), timeout=60)
 
@@ -400,35 +452,44 @@ def run(output):
                         "administrator_resistant_storage": False, "continuous_monitoring": False}}
     evidence, files = {}, {}
     current_step = "preparing pinned VM image and private boot media"
+    progress(current_step + "; selected accelerator=" + vm.accelerator)
     try:
         evidence["image"] = {"url": IMAGE_URL, "sha256": IMAGE_SHA256}
         evidence["virtualization"] = vm.prepare()
         current_step = "booting guest and waiting for cloud-init"
+        progress(current_step)
         vm.launch()
         evidence["virtualization"]["qmp_kvm"] = vm.kvm_status
+        evidence["cloud_init"] = vm.cloud_init
         current_step = "collecting preboot evidence"
+        progress(current_step)
         before = vm.guest("before")
         before_reference = vm.ssh("sudo -n cat " + GUEST_REPORT + "/BEFORE.json", timeout=15).stdout
         require(len(before_reference) <= 8 * 1024 * 1024, "The preboot reference exceeds its size limit.")
         evidence["preboot_reference_sha256"] = hashlib.sha256(before_reference).hexdigest()
         current_step = "performing and verifying full guest reboot"
+        progress(current_step)
         evidence["reboot"] = vm.reboot()
         require(before["boot_id"] == evidence["reboot"]["before"]["boot_id"], "Guest pre-reboot records disagree.")
         current_step = "verifying automatic startup and fresh recovery"
+        progress(current_step)
         after = vm.guest("after")
         require(after["boot_id"] == evidence["reboot"]["after"]["boot_id"], "Guest post-reboot records disagree.")
         evidence["guest_stages"] = {"before": before, "after": after}
         current_step = "exporting and comparing preserved evidence"
+        progress(current_step)
         files = vm.export_guest()
         validate_preserved_history(before_reference, files, source, evidence["reboot"])
         evidence["preboot_reference_held_outside_guest"] = True
         current_step = "cleaning guest service and state"
+        progress(current_step)
         evidence["guest_cleanup"] = vm.guest("cleanup")
         require(source_identity() == source, "Reboot lab source changed during execution.")
     except (OSError, ValueError, RuntimeError, KeyError, TypeError, subprocess.SubprocessError, tarfile.TarError) as error:
         report["error"] = current_step + ": " + vm.redact(error).replace(str(destination), "<report>")
     finally:
         try:
+            progress("stopping the owned VM and removing its private credentials and disk")
             evidence["cleanup"] = vm.cleanup()
         except (OSError, ValueError, RuntimeError, subprocess.SubprocessError) as error:
             evidence["cleanup"] = {"ok": False, "error": vm.redact(error)}

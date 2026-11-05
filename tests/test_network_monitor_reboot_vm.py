@@ -90,13 +90,52 @@ class VMHostTests(unittest.TestCase):
         self.assertFalse(config['ssh_pwauth'])
         self.assertTrue(config['disable_root'])
         self.assertTrue(config['users'][0]['lock_passwd'])
-        self.assertEqual(config['ssh_genkeytypes'], [])
+        self.assertNotIn('ssh_genkeytypes', config)
         self.assertEqual(config['ssh_keys']['ed25519_public'], 'ssh-ed25519 host')
         self.assertEqual(config['write_files'][0]['permissions'], '0600')
         marker = json.loads(config['write_files'][0]['content'])
         self.assertEqual(marker, {'format': 'heltemes-disposable-reboot-vm', 'version': 1, 'token': 'a' * 32})
         with self.assertRaises(RuntimeError):
             lab.cloud_configuration('../not-token', '', '', '')
+
+    def test_clean_cloud_init_requires_zero_exit_and_done_status(self):
+        value = {'status': 'done', 'extended_status': 'done', 'boot_status_code': 'enabled-by-generator',
+                 'errors': [], 'recoverable_errors': {}, 'modules-final': {'errors': [], 'recoverable_errors': {}}}
+        result = subprocess.CompletedProcess([], 0, json.dumps(value).encode(), b'')
+        self.assertEqual(lab.cloud_init_status(result, str)['exit_code'], 0)
+        for code, status, extended in [(2, 'done', 'degraded done'), (1, 'error', 'error - done'),
+                                       (0, 'running', 'running'), (0, 'disabled', 'disabled')]:
+            with self.subTest(code=code, status=status):
+                bad = {**value, 'status': status, 'extended_status': extended}
+                with self.assertRaisesRegex(RuntimeError, 'did not complete cleanly'):
+                    lab.cloud_init_status(subprocess.CompletedProcess([], code, json.dumps(bad).encode(), b''), str)
+
+    def test_cloud_init_nested_errors_cannot_hide_behind_clean_top_level(self):
+        value = {'status': 'done', 'extended_status': 'done', 'errors': [], 'recoverable_errors': {},
+                 'modules-final': {'errors': [], 'recoverable_errors': {'WARNING': ['package install failed']}}}
+        result = subprocess.CompletedProcess([], 0, json.dumps(value).encode(), b'')
+        with self.assertRaisesRegex(RuntimeError, 'package install failed'):
+            lab.cloud_init_status(result, str)
+
+    def test_cloud_init_diagnostics_omit_private_key_token_and_paths(self):
+        vm = lab.DisposableVM(TOOLS); vm.directory = self.directory
+        message = str(self.directory) + ' ' + vm.token + ' -----BEGIN OPENSSH PRIVATE KEY-----\nsecret-body\n-----END OPENSSH PRIVATE KEY-----'
+        value = {'status': 'done', 'extended_status': 'degraded done', 'errors': [],
+                 'recoverable_errors': {'WARNING': [message]}}
+        result = subprocess.CompletedProcess([], 2, json.dumps(value).encode(), b'')
+        with self.assertRaises(RuntimeError) as caught:
+            lab.cloud_init_status(result, vm.redact)
+        text = str(caught.exception)
+        for private in (str(self.directory), vm.token, 'secret-body', 'BEGIN OPENSSH'):
+            self.assertNotIn(private, text)
+        self.assertIn('private-key-omitted', text)
+
+    def test_cloud_init_malformed_or_oversized_status_fails_without_raw_output(self):
+        for content in (b'not-json-private', b'[]', b'x' * (1024 * 1024 + 1)):
+            with self.subTest(size=len(content)):
+                with self.assertRaises(RuntimeError) as caught:
+                    lab.cloud_init_status(subprocess.CompletedProcess([], 2, content, b''), str)
+                self.assertNotIn('not-json-private', str(caught.exception))
 
     def test_source_package_excludes_host_program_and_unrelated_private_files(self):
         for name in lab.SOURCE_FILES:
@@ -287,7 +326,7 @@ class VMHostTests(unittest.TestCase):
 
     def test_publication_waits_for_guest_and_host_cleanup(self):
         source, files = public_fixture()
-        vm = Mock(token='a' * 32, kvm_status={'enabled': False, 'present': True})
+        vm = Mock(token='a' * 32, accelerator='tcg', kvm_status={'enabled': False, 'present': True}, cloud_init={'status': 'done', 'exit_code': 0})
         vm.prepare.return_value = {'accelerator': 'tcg'}
         vm.guest.side_effect = [dict(ok=True, boot_id=BOOT_A), dict(ok=True, boot_id=BOOT_B), dict(ok=True)]
         vm.ssh.return_value = subprocess.CompletedProcess([], 0, files['BEFORE.json'], b'')
@@ -306,7 +345,7 @@ class VMHostTests(unittest.TestCase):
 
     def test_failed_vm_cleanup_never_publishes_success_artifact(self):
         source, _ = public_fixture()
-        vm = Mock()
+        vm = Mock(accelerator='tcg')
         vm.prepare.side_effect = RuntimeError('controlled setup failure')
         vm.redact.side_effect = str
         vm.cleanup.return_value = {'ok': False, 'vm_stopped': False}
