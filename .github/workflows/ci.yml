@@ -184,6 +184,43 @@ jobs:
           cat work/network-monitoring/publish/SUMMARY.md >> "$GITHUB_STEP_SUMMARY"
           printf '\n[Download monitoring evidence](%s)\n' "$ARTIFACT_URL" >> "$GITHUB_STEP_SUMMARY"
 
+      - name: Exercise monitor crashes and supervised restart
+        env:
+          REVIEWER_PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          sudo -n --preserve-env=GITHUB_ACTIONS,GITHUB_SHA,GITHUB_EVENT_NAME,GITHUB_REPOSITORY,GITHUB_RUN_ID,GITHUB_RUN_ATTEMPT,GITHUB_SERVER_URL,REVIEWER_PR_HEAD_SHA \
+            "$(command -v python3)" -I -S -B scripts/network_monitor_restart_lab.py --output work/monitor-restart
+      - name: Retain monitor restart evidence
+        id: monitor_restart_evidence
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: monitor-restart-${{ github.sha }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            work/monitor-restart/publish/REPORT.json
+            work/monitor-restart/publish/MANIFEST.json
+            work/monitor-restart/publish/APPROVED_POLICY.json
+            work/monitor-restart/publish/OBSERVATIONS.json
+            work/monitor-restart/publish/JOURNAL.json
+            work/monitor-restart/publish/ALERTS.json
+            work/monitor-restart/publish/EVENTS.jsonl
+            work/monitor-restart/publish/SERVICE.json
+            work/monitor-restart/publish/SUMMARY.md
+            work/monitor-restart/publish/policy.nft
+            work/monitor-restart/publish/user.pcap
+            work/monitor-restart/publish/user-packets.txt
+            work/monitor-restart/publish/app.pcap
+            work/monitor-restart/publish/app-packets.txt
+            work/monitor-restart/publish/management.pcap
+            work/monitor-restart/publish/management-packets.txt
+          if-no-files-found: error
+          retention-days: 30
+      - name: Show monitor restart results
+        env:
+          ARTIFACT_URL: ${{ steps.monitor_restart_evidence.outputs.artifact-url }}
+        run: |
+          cat work/monitor-restart/publish/SUMMARY.md >> "$GITHUB_STEP_SUMMARY"
+          printf '\n[Download monitor restart evidence](%s)\n' "$ARTIFACT_URL" >> "$GITHUB_STEP_SUMMARY"
+
   reviewer:
     needs: [python, terraform, network_lab]
     runs-on: ubuntu-latest

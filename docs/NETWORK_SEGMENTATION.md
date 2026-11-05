@@ -2,7 +2,7 @@
 
 This exercise adds three separate IPv4 networks connected through one policy-enforcing router. It tests which new connections may cross those boundaries, proves denied destinations are healthy, introduces a permissive rule by mistake, and repeats the policy matrix after repair. It runs on a disposable Linux VM with synthetic HTTP services.
 
-The original [routing exercise](NETWORK_LAB.md), [DNS/TLS exercise](NETWORK_SERVICES_LAB.md), and this segmentation exercise have separate reports. The [monitoring expansion](NETWORK_MONITORING.md) adds rule snapshots, packet-counter deltas, active canaries, and alert recovery. All four network exercises must pass the required `network_lab` job. A particular run is accepted only after its checks, packet evidence, cleanup, and downloaded artifact inspection succeed. AWS, the installed Evidence application, its real signing key, and accepted history remain outside this exercise.
+The original [routing exercise](NETWORK_LAB.md), [DNS/TLS exercise](NETWORK_SERVICES_LAB.md), and this segmentation exercise have separate reports. The [monitoring expansion](NETWORK_MONITORING.md) adds rule snapshots, packet-counter deltas, active canaries, and alert recovery. The [service-restart exercise](NETWORK_MONITOR_RESTART.md) tests durable monitoring history. All five network exercises must pass the required `network_lab` job. A particular run is accepted only after its checks, packet evidence, cleanup, and downloaded artifact inspection succeed. AWS, the installed Evidence application, its real signing key, and accepted history remain outside this exercise.
 
 ## Topology
 
