@@ -40,7 +40,7 @@ class MonitorStoreTests(unittest.TestCase):
         with store.Journal(self.state) as journal:
             self.assertEqual(journal.identity, self.identity)
             self.assertEqual(journal.connection.execute("PRAGMA journal_mode").fetchone(), ("delete",))
-            self.assertEqual(journal.connection.execute("PRAGMA synchronous").fetchone(), (2,))
+            self.assertEqual(journal.connection.execute("PRAGMA synchronous").fetchone(), (3,))
             self.assertEqual(journal.connection.execute("PRAGMA trusted_schema").fetchone(), (0,))
             self.assertEqual(journal.status()["committed_count"], 0)
 

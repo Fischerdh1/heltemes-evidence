@@ -58,8 +58,11 @@ def request(state, payload, timeout=10):
 
 
 class Service:
-    def __init__(self, journal, allow_test_crashes=False):
+    def __init__(self, journal, allow_test_crashes=False, test_pause=None):
         self.journal, self.allow_test_crashes = journal, allow_test_crashes
+        # Only the separately guarded disposable VM worker installs this hook.
+        # The ordinary service CLI never enables a transaction pause.
+        self.test_pause = test_pause
         self.instance_id = uuid.uuid4().hex
         self.started = time.monotonic()
         self.base_elapsed = journal.rows[-1]["sample"]["elapsed_seconds"] if journal.rows else 0.0
@@ -81,19 +84,26 @@ class Service:
             store.require(set(payload) == {"command"}, "Unexpected export fields.")
             return {"ok": True, **self.journal.export(), "current_status": self.status()}
         store.require(command == "observe" and set(payload) in (
-            {"command", "request_id", "observation"}, {"command", "request_id", "observation", "test_crash"}),
+            {"command", "request_id", "observation"}, {"command", "request_id", "observation", "test_crash"},
+            {"command", "request_id", "observation", "test_pause"}),
             "Observation request fields are invalid.")
         point = payload.get("test_crash")
         store.require(point is None or (self.allow_test_crashes and point in CRASH_CODES), "Test crash is disabled or invalid.")
+        pause = payload.get("test_pause")
+        store.require("test_pause" not in payload or (self.test_pause is not None and pause in CRASH_CODES),
+                      "Test pause is disabled or invalid.")
         def fault(current):
             if current == point:
                 os._exit(CRASH_CODES[current])
+            if current == pause:
+                self.test_pause(self, current, payload)
+                raise RuntimeError("A test pause must not return to normal service.")
         result = self.journal.append(payload["request_id"], payload["observation"],
-                    self.base_elapsed + time.monotonic() - self.started, fault=fault if point else None)
+                    self.base_elapsed + time.monotonic() - self.started, fault=fault if point or pause else None)
         return {"ok": True, **result, "result_is_historical": result["duplicate"], "current_status": self.status()}
 
 
-def serve(state, *, allow_test_crashes=False):
+def serve(state, *, allow_test_crashes=False, test_pause=None):
     path = socket_path(state)
     with store.Journal(state) as journal:
         # The lifetime lock permits removing only our owned stale socket.
@@ -102,7 +112,7 @@ def serve(state, *, allow_test_crashes=False):
             store.require(stat.S_ISSOCK(info.st_mode) and info.st_uid == os.geteuid()
                           and stat.S_IMODE(info.st_mode) == 0o600, "Unexpected object occupies the monitor socket path.")
             path.unlink()
-        service = Service(journal, allow_test_crashes)
+        service = Service(journal, allow_test_crashes, test_pause=test_pause)
         stopping = False
         def stop(signum, frame):
             nonlocal stopping

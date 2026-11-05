@@ -79,7 +79,7 @@ Use the following explanation only after the corresponding run and its saved evi
 
 ## Limits
 
-This demonstrates an orderly full Linux guest reboot. Sudden power removal, storage-controller failures, disk loss, long-running retention, continuous collection, external notification delivery, and administrator-resistant custody remain separate work. The journal remains bounded to 256 rows. The lab's root-owned service is not evidence of dedicated-account isolation.
+This demonstrates an orderly full Linux guest reboot. The separate [power-cut exercise](NETWORK_MONITOR_POWERCUT.md) tests abrupt loss of the virtual guest. Physical power removal, storage-controller failures, disk loss, long-running retention, continuous collection, external notification delivery, and administrator-resistant custody remain separate work. The journal remains bounded to 256 rows. The lab's root-owned service is not evidence of dedicated-account isolation.
 
 The temporary VM and its private credentials are removed after evidence export. The lab does not install a permanent service on the Mac or change its firewall. AWS remains deferred.
 
