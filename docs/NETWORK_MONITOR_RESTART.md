@@ -4,6 +4,8 @@ This exercise extends the [sampled network monitor](NETWORK_MONITORING.md) with 
 
 AWS, the installed Evidence app, its signing key, filings, and accepted history are outside the exercise. The monitor's state identity is a separate disposable lab identifier.
 
+The separate [full VM reboot exercise](NETWORK_MONITOR_REBOOT.md) extends this work with persistent disk storage and a boot-enabled service. The process-restart exercise below retains its original temporary-storage scope.
+
 ## What is saved
 
 Each accepted observation and its resulting evaluation/events are committed together in a SQLite transaction. The journal uses rollback-journal mode and full synchronization. On reopening, the program checks the state identity, approved policy, schema and engine version, then replays the observations and compares the saved outcomes. It does not restore an arbitrary serialized Python object.
