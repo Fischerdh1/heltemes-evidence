@@ -1,6 +1,6 @@
 # Diagnose DNS, connection, and TLS failures
 
-This expansion asks three separate questions: did DNS return the expected address, could the client establish a connection, and did TLS accept the server's certificate? It runs after the [routing and firewall exercise](NETWORK_LAB.md) on a disposable Ubuntu 24.04 GitHub runner, using new network namespaces and synthetic services. These exercises and the separate [segmentation exercise](NETWORK_SEGMENTATION.md) must pass the required `network_lab` job.
+This expansion asks three separate questions: did DNS return the expected address, could the client establish a connection, and did TLS accept the server's certificate? It runs after the [routing and firewall exercise](NETWORK_LAB.md) on a disposable Ubuntu 24.04 GitHub runner, using new network namespaces and synthetic services. These exercises and the separate [segmentation](NETWORK_SEGMENTATION.md) and [monitoring](NETWORK_MONITORING.md) exercises must pass the required `network_lab` job.
 
 A particular result is established by its completed workflow and downloaded evidence. The report records the tested commit, actual execution time, individual probes, capture observations, firewall counters, and cleanup outcome. This source change does not deploy AWS or change the installed HELTEMES Evidence application, real signing key, or accepted history.
 

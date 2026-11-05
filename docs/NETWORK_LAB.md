@@ -2,7 +2,7 @@
 
 This lab adds a network-security case study to HELTEMES Evidence. It creates three Linux network namespaces, routes synthetic HTTP traffic through a firewall, detects an intentionally permissive rule, and verifies the repaired policy. Each run records the tested source, traffic observations, packet capture, firewall counters, and cleanup result.
 
-The [DNS and TLS expansion](NETWORK_SERVICES_LAB.md) adds a separate exercise on a fresh copy of this topology. It checks name resolution, server-certificate identity, an untrusted issuer, and a blocked TLS connection. The [segmentation expansion](NETWORK_SEGMENTATION.md) adds three separate networks with a tested access matrix. All three exercises run within the required `network_lab` job and publish separate evidence packages.
+The [DNS and TLS expansion](NETWORK_SERVICES_LAB.md) adds a separate exercise on a fresh copy of this topology. It checks name resolution, server-certificate identity, an untrusted issuer, and a blocked TLS connection. The [segmentation expansion](NETWORK_SEGMENTATION.md) adds three separate networks with a tested access matrix. The [monitoring expansion](NETWORK_MONITORING.md) adds rule comparison, packet-counter observations, connection checks, and alert recovery. All four exercises run within the required `network_lab` job and publish separate evidence packages.
 
 The lab operates inside a disposable Linux VM and uses synthetic content. It does not require administrator changes on the personal Mac or access to the real filing archive, signing key, or accepted trust history.
 
