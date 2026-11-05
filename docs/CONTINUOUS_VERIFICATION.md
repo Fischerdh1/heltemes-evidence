@@ -1,10 +1,12 @@
 # Reviewable evidence for each change
 
-The `reviewer` job in `Verify project` runs after both Python test jobs, Terraform validation, the isolated Linux network lab, and the full guest-reboot exercise succeed. It creates a fresh synthetic archive, runs the existing 12-phase demonstration, packages the source and results, and retains a downloadable artifact for 30 days. A new run has its own identifiers and timestamps. The network lab retains its own packet capture and policy observations. See [the network lab guide](NETWORK_LAB.md) for that separate report.
+The `reviewer` job in `Verify project` runs after both Python test jobs, Terraform validation, the isolated Linux network lab, the full guest-reboot exercise, and the abrupt virtual-power-loss exercise succeed. It creates a fresh synthetic archive, runs the existing 12-phase demonstration, packages the source and results, and retains a downloadable artifact for 30 days. A new run has its own identifiers and timestamps. The network lab retains its own packet capture and policy observations. See [the network lab guide](NETWORK_LAB.md) for that separate report.
 
 The required `network_lab` job runs the routing/firewall exercise, the [DNS/TLS exercise](NETWORK_SERVICES_LAB.md), the [segmentation exercise](NETWORK_SEGMENTATION.md), the [monitoring exercise](NETWORK_MONITORING.md), and the [service-restart exercise](NETWORK_MONITOR_RESTART.md). Each has a separate artifact. A successful earlier exercise does not establish that the entire job passed; verify all five results and the final job status. DNS/TLS uploads exclude temporary private keys. All five artifacts use the same 30-day retention period.
 
 The separate `monitor_reboot` job boots and reboots a disposable Ubuntu guest, verifies persistent monitoring state and automatic service startup, and publishes a sixth network artifact. Its [full-reboot guide](NETWORK_MONITOR_REBOOT.md) explains the additional evidence. The required `reviewer` job runs its prerequisite guard even if an earlier job fails or is skipped, and explicitly requires all prerequisite results to be `success`. A dependency alone would allow the reviewer job to be skipped, which is insufficient as an explicit success gate.
+
+The separate `monitor_powercut` job performs two abrupt cuts of the entire disposable VM and cold-starts the same disk after each. Its [power-cut guide](NETWORK_MONITOR_POWERCUT.md) describes the unfinished-transaction and lost-response cases, automatic unknown coverage, and fresh recovery checks. It publishes a seventh network artifact and is included in the explicit reviewer prerequisite guard. This simulates guest power loss while the host remains powered.
 
 ## Inspect a run
 

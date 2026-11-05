@@ -277,9 +277,66 @@ jobs:
           cat work/monitor-reboot/publish/SUMMARY.md >> "$GITHUB_STEP_SUMMARY"
           printf '\n[Download full reboot evidence](%s)\n' "$ARTIFACT_URL" >> "$GITHUB_STEP_SUMMARY"
 
+  monitor_powercut:
+    needs: [python]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@e797f83bcb11b83ae66e0230d6156d7c80228e7c # v6.0.0
+        with:
+          python-version: '3.14'
+      - name: Install disposable guest VM tools
+        run: |
+          sudo apt-get update
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y qemu-system-x86 qemu-utils cloud-image-utils openssh-client curl
+      - name: Exercise abrupt virtual power loss and cold-start recovery
+        env:
+          REVIEWER_PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          mkdir -p work
+          python3 -I -S -B scripts/network_monitor_powercut_vm.py --output work/monitor-powercut
+      - name: Retain abrupt virtual power-loss evidence
+        id: powercut_evidence
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: monitor-powercut-${{ github.sha }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            work/monitor-powercut/publish/REPORT.json
+            work/monitor-powercut/publish/VM.json
+            work/monitor-powercut/publish/SUMMARY.md
+            work/monitor-powercut/publish/MANIFEST.json
+            work/monitor-powercut/publish/BEFORE.json
+            work/monitor-powercut/publish/AFTER_BEFORE.json
+            work/monitor-powercut/publish/AFTER.json
+            work/monitor-powercut/publish/APPROVED_POLICY.json
+            work/monitor-powercut/publish/monitor.service
+            work/monitor-powercut/publish/before-user.pcap
+            work/monitor-powercut/publish/before-user-packets.txt
+            work/monitor-powercut/publish/before-app.pcap
+            work/monitor-powercut/publish/before-app-packets.txt
+            work/monitor-powercut/publish/before-management.pcap
+            work/monitor-powercut/publish/before-management-packets.txt
+            work/monitor-powercut/publish/after-user.pcap
+            work/monitor-powercut/publish/after-user-packets.txt
+            work/monitor-powercut/publish/after-app.pcap
+            work/monitor-powercut/publish/after-app-packets.txt
+            work/monitor-powercut/publish/after-management.pcap
+            work/monitor-powercut/publish/after-management-packets.txt
+          if-no-files-found: error
+          retention-days: 30
+      - name: Show virtual power-loss results
+        env:
+          ARTIFACT_URL: ${{ steps.powercut_evidence.outputs.artifact-url }}
+        run: |
+          cat work/monitor-powercut/publish/SUMMARY.md >> "$GITHUB_STEP_SUMMARY"
+          printf '\n[Download virtual power-loss evidence](%s)\n' "$ARTIFACT_URL" >> "$GITHUB_STEP_SUMMARY"
+
   reviewer:
     if: ${{ always() }}
-    needs: [python, terraform, network_lab, monitor_reboot]
+    needs: [python, terraform, network_lab, monitor_reboot, monitor_powercut]
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
@@ -290,9 +347,9 @@ jobs:
           python3 - <<'PY'
           import json, os
           results = json.loads(os.environ['PREREQUISITE_RESULTS'])
-          expected = {'python', 'terraform', 'network_lab', 'monitor_reboot'}
+          expected = {'python', 'terraform', 'network_lab', 'monitor_reboot', 'monitor_powercut'}
           if set(results) != expected or any(value.get('result') != 'success' for value in results.values()):
-              raise SystemExit('Reviewer blocked: every prerequisite, including the full VM reboot, must succeed.')
+              raise SystemExit('Reviewer blocked: every prerequisite, including the VM reboot and abrupt virtual power loss, must succeed.')
           PY
       - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
         with:

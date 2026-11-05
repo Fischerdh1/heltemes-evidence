@@ -117,9 +117,11 @@ def configure(connection):
     connection.execute("PRAGMA trusted_schema=OFF")
     require(connection.execute("PRAGMA trusted_schema").fetchone() == (0,), "Untrusted schema mode is required.")
     require(connection.execute("PRAGMA journal_mode=DELETE").fetchone()[0] == "delete", "Rollback journaling is required.")
-    connection.execute("PRAGMA synchronous=FULL")
+    # DELETE mode also needs the containing directory synchronized after the
+    # rollback journal is removed. EXTRA includes that final commit boundary.
+    connection.execute("PRAGMA synchronous=EXTRA")
     connection.execute("PRAGMA foreign_keys=ON")
-    require(connection.execute("PRAGMA synchronous").fetchone()[0] == 2, "Full commit synchronization is required.")
+    require(connection.execute("PRAGMA synchronous").fetchone()[0] == 3, "Extra commit synchronization is required.")
 
 
 def initialize(value, approved):

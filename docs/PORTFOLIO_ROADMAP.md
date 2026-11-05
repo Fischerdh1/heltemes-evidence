@@ -39,6 +39,8 @@ The [service-restart expansion](NETWORK_MONITOR_RESTART.md) adds a transactional
 
 The [full-reboot expansion](NETWORK_MONITOR_REBOOT.md) separately tests an orderly Linux guest reboot using persistent disk storage and an enabled boot service. Acceptance requires changed boot identity, automatic startup, exact preservation of committed history, and fresh recovery observations. Physical power loss and continuous production operation remain separate milestones.
 
+The [virtual power-cut expansion](NETWORK_MONITOR_POWERCUT.md) tests two abrupt guest interruptions on the same disk: before transaction commit and after commit before acknowledgement. Acceptance requires observed whole-VM termination, automatic startup on a new kernel boot, exact committed-history recovery, an idempotent retry, and fresh network verification. The host remains powered; this does not establish physical storage power-loss behavior.
+
 ## Proposed stages
 
 | Planning window | Engineering work | Evidence required | What Fischer should be able to do |
