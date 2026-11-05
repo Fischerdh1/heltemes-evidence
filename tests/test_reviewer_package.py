@@ -82,6 +82,7 @@ class ReviewerPackageTests(unittest.TestCase):
             self.assertIn("report/phases/06-crash.json", manifest)
             self.assertIn(b"Expected crash", archive.read("index.html"))
             self.assertIn(b"Expected rejection", archive.read("index.html"))
+            self.assertIn(b"Demo completed (UTC): 2026-11-01T00:00:00Z", archive.read("index.html"))
             self.assertNotIn(b"<script", archive.read("index.html"))
 
     def test_changed_runtime_source_refuses_stale_report(self):

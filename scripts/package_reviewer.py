@@ -153,7 +153,8 @@ def _page(result, version):
 <h1>Preserve the evidence.<br>Verify the recovery.</h1>
 <p><strong>An original security-engineering portfolio project by Fischer Heltemes.</strong></p>
 <p class="lead">A reproducible demonstration of signed evidence history and recovery that keeps signing blocked until the authorized transition is complete.</p>
-<p class="muted">Reviewer package · November 1, 2026 · Runtime source v""" + escape(version) + """ · Synthetic data only</p>
+<p class="muted">Reviewer edition · November 1, 2026 · Runtime source v""" + escape(version) + """ · Synthetic data only</p>
+<p class="muted">Demo completed (UTC): """ + escape(str(result.get("completed_at_utc", "Unavailable"))) + """</p>
 <nav aria-label="Reviewer links"><a href="source/docs/REVIEWER_GUIDE.md">Reviewer guide</a><a href="report/WALKTHROUGH.txt">Observed walkthrough</a><a href="report/results.json">Machine-readable results</a><a href="MANIFEST.json">File fingerprints</a></nav></header>
 <div class="stats"><div class="stat"><strong>""" + str(len(result["phases"])) + """ / """ + str(len(result["phases"])) + """</strong><span>phase outcomes matched expectations</span></div><div class="stat"><strong>""" + str(summary["verified_objects"]) + """ objects</strong><span>verified from synthetic evidence</span></div><div class="stat"><strong>1 → 2 → 3</strong><span>baseline → recovery → ordinary signing</span></div></div>
 <section><h2>The control being demonstrated</h2><p>Archive verification and permission to sign are separate decisions. Valid preserved evidence can remain readable while new signatures are deliberately blocked.</p>
