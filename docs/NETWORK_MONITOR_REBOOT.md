@@ -36,6 +36,8 @@ flowchart TD
 
 Network namespaces and packet counters are temporary kernel state. Recreating them is separate from recovering the monitor's saved history. Counter comparisons must not bridge the reboot gap, and a previous healthy result cannot establish current health.
 
+Boot and setup may take longer than the monitor's 30-second sampling bound. The first postboot observation can therefore report a further collection gap even though its rules are freshly read. The controller takes another fresh rule-only observation to establish the new counter baseline before the connection checks. The sampling limit remains unchanged, and the original access incident stays open throughout this step.
+
 ## Evidence and acceptance
 
 The host controller and guest each retain evidence. Acceptance checks require a changed guest boot ID, automatic service startup, persistent disk identity, an unchanged journal prefix, and the same incident identity. Packet captures show the actual synthetic connection attempts before and after reboot. Checksums bind the public files to one another, and source hashes identify the code used for the run.

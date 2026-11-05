@@ -424,7 +424,7 @@ def validate_preserved_history(reference, files, source, reboot):
     canonical = lambda value: json.dumps(value, sort_keys=True, separators=(",", ":"), allow_nan=False)
     require(canonical(original["identity"]) == canonical(automatic["identity"]) == canonical(final["identity"]),
             "The original persistent journal identity was replaced during reboot.")
-    require(len(original["rows"]) == 5 and len(automatic["rows"]) == 6 and len(final["rows"]) == 8
+    require(len(original["rows"]) == 5 and len(automatic["rows"]) == 6 and len(final["rows"]) == 9
             and canonical(original["rows"]) == canonical(automatic["rows"][:5]) == canonical(final["rows"][:5]),
             "The host-held preboot history does not match the reopened journal prefix.")
     require(after["automatic_start"]["no_manual_service_start"] is True

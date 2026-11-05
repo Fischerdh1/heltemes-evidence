@@ -34,7 +34,7 @@ def public_fixture():
     hashes = {key: value for key, value in source['source_sha256'].items() if key != lab.SOURCE_FILES[-1]}
     original = {'identity': {'database_id': 'd' * 32}, 'rows': [{'sequence': i} for i in range(1, 6)]}
     automatic = {'identity': copy.deepcopy(original['identity']), 'rows': original['rows'] + [{'sequence': 6}]}
-    final = {'identity': copy.deepcopy(original['identity']), 'rows': automatic['rows'] + [{'sequence': 7}, {'sequence': 8}]}
+    final = {'identity': copy.deepcopy(original['identity']), 'rows': automatic['rows'] + [{'sequence': 7}, {'sequence': 8}, {'sequence': 9}]}
     before = {'boot': {'boot_id': BOOT_A}, 'source_sha256': hashes, 'journal': original, 'critical_incident_id': 'critical#1'}
     after = {'boot': {'boot_id': BOOT_B}, 'source_sha256': hashes, 'journal': final, 'critical_incident_id': 'critical#1',
              'automatic_start': {'journal': automatic, 'no_manual_service_start': True,
@@ -269,7 +269,7 @@ class VMHostTests(unittest.TestCase):
         mutations = [
             ('identity', lambda x: x['journal']['identity'].update(database_id='new')),
             ('prefix', lambda x: x['journal']['rows'][0].update(sequence=100)),
-            ('duplicate', lambda x: x['journal']['rows'].append({'sequence': 9})),
+            ('duplicate', lambda x: x['journal']['rows'].append({'sequence': 10})),
             ('source', lambda x: x['source_sha256'].update({lab.SOURCE_FILES[0]: '0' * 64})),
             ('manual', lambda x: x['automatic_start'].update(no_manual_service_start=False)),
             ('false-healthy', lambda x: x['automatic_start']['status']['current_evaluation'].update(status='healthy')),

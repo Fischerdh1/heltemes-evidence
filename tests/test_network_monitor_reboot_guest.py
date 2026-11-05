@@ -86,13 +86,57 @@ class GuestControllerTests(unittest.TestCase):
         self.assertEqual(len(startup['journal']['rows']), 6)
         self.assertEqual(startup['journal']['rows'][:5], before['journal']['rows'])
         self.assertEqual(after['journal']['identity'], before['journal']['identity'])
-        self.assertEqual(len(after['journal']['rows']), 8)
+        self.assertEqual(len(after['journal']['rows']), 9)
         self.assertEqual(after['final_status']['current_evaluation']['status'], 'healthy')
         events = [e for e in after['journal']['events'] if e['key'] == guest.CRITICAL]
         self.assertEqual([(e['action'], e['phase'], e['sequence']) for e in events],
-                         [('opened', 'before_forbidden', 5), ('resolved', 'after_canaries', 8)])
+                         [('opened', 'before_forbidden', 5), ('resolved', 'after_canaries', 9)])
         self.assertEqual([r['request']['observation']['phase'] for r in after['observations']],
-                         ['after_reference', 'after_canaries'])
+                         ['after_reference', 'after_interval', 'after_canaries'])
+
+    def test_slow_boot_keeps_sampling_bound_and_requires_fresh_interval_before_recovery(self):
+        before = self.before(); self.start_worker()
+        # Deterministically advance service elapsed time without sleeping or
+        # changing the monitor's 30-second bound. This models slow VM boot/setup.
+        self.worker.started -= 31
+        after = guest.run_after(NetworkFixture(), before, self.after_boot, self.hashes, self.storage)
+        rows = after['journal']['rows']
+        delayed, interval, recovered = rows[6:]
+        self.assertGreater(delayed['sample']['elapsed_seconds'] - rows[5]['sample']['elapsed_seconds'], 30)
+        self.assertEqual(delayed['evaluation']['status'], 'unknown')
+        self.assertFalse(delayed['evaluation']['telemetry_valid'])
+        self.assertIn('Observation gap exceeds the sampling bound or skips a sequence.', delayed['evaluation']['diagnostics'])
+        self.assertIn(guest.CRITICAL, delayed['evaluation']['active_alert_keys'])
+        self.assertEqual(interval['sample']['phase'], 'after_interval')
+        self.assertTrue(interval['evaluation']['telemetry_valid'])
+        self.assertTrue(interval['evaluation']['policy_matches'])
+        self.assertTrue(all(value is None for value in interval['evaluation']['counter_deltas'].values()))
+        self.assertIn(guest.CRITICAL, interval['evaluation']['active_alert_keys'])
+        self.assertEqual(recovered['sequence'], 9)
+        self.assertEqual(recovered['evaluation']['status'], 'healthy')
+        self.assertGreater(recovered['evaluation']['counter_deltas']['drop_user_app_9090'], 0)
+        self.assertNotIn(guest.CRITICAL, recovered['evaluation']['active_alert_keys'])
+        self.assertEqual(self.worker.journal.engine.max_gap_seconds, 30)
+        self.assertEqual(len(after['automatic_start']['journal']['rows']), 6)
+        self.assertEqual(after['capture']['routed_flows_verified'], 3)
+
+    def test_recovery_failure_reports_only_selected_evaluation_diagnostics(self):
+        before = self.before(); self.start_worker()
+        original = guest.observe
+        def false_recovery(*args, **kwargs):
+            result = original(*args, **kwargs)
+            if args[2] == 'after_canaries':
+                result['current_evaluation']['status'] = 'unknown'
+                result['current_evaluation']['diagnostics'] = ['test incomplete coverage']
+                result['private_detail'] = 'must not be printed'
+            return result
+        with patch.object(guest, 'observe', side_effect=false_recovery), self.assertRaises(RuntimeError) as caught:
+            guest.run_after(NetworkFixture(), before, self.after_boot, self.hashes, self.storage)
+        message = str(caught.exception)
+        self.assertIn('Fresh committed checks', message)
+        self.assertIn('test incomplete coverage', message)
+        self.assertIn('after_canaries', message)
+        self.assertNotIn('must not be printed', message)
 
     def verify(self, before, **overrides):
         args = {'boot': self.after_boot, 'status': self.request({'command': 'status'}),

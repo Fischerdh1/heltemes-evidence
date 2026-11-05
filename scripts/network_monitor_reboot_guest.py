@@ -231,7 +231,7 @@ def observe(lab, observations, phase, rows=()):
 def inventory(lab, observations, stage):
     expected = {'before': [('before_reference', ()), ('before_baseline', monitoring.CANARIES),
                            ('before_rule_drift', ()), ('before_forbidden', (segmentation.EXCEPTION,))],
-                'after': [('after_reference', ()), ('after_canaries', monitoring.CANARIES)]}[stage]
+                'after': [('after_reference', ()), ('after_interval', ()), ('after_canaries', monitoring.CANARIES)]}[stage]
     require([r['request']['observation']['phase'] for r in observations] == [name for name, _ in expected],
             'Guest observation phases differ.')
     routed = [p for p in lab.probes if p['from'] != p['to']]
@@ -253,6 +253,12 @@ def inventory(lab, observations, stage):
                 segmentation.require_response(health, probe['to'], probe['port'])
 
 
+def evaluation_diagnostic(status):
+    evaluation = status['current_evaluation']
+    fields = ('sequence', 'phase', 'status', 'telemetry_valid', 'policy_matches', 'diagnostics', 'active_alert_keys')
+    return json.dumps({key: evaluation.get(key) for key in fields}, sort_keys=True)
+
+
 def run_before(lab):
     lab.setup(); lab.start_services(); lab.apply_policy()
     approved = lab.ruleset()
@@ -261,7 +267,8 @@ def run_before(lab):
     observations = []
     observe(lab, observations, 'before_reference')
     baseline = observe(lab, observations, 'before_baseline', monitoring.CANARIES)
-    require(baseline['current_evaluation']['status'] == 'healthy', 'Fresh baseline was not healthy.')
+    require(baseline['current_evaluation']['status'] == 'healthy',
+            'Fresh baseline was not healthy: ' + evaluation_diagnostic(baseline))
     lab.apply_policy('misconfigured')
     drift = observe(lab, observations, 'before_rule_drift')
     require('rule_drift:ruleset' in drift['current_evaluation']['active_alert_keys'], 'Incorrect rule was not detected.')
@@ -312,16 +319,24 @@ def run_after(lab, before, boot, hashes, storage):
     observations = []
     reference = observe(lab, observations, 'after_reference')
     require(critical(reference)['id'] == before['critical_incident_id'], 'Rules alone incorrectly cleared the old incident.')
+    # Boot/network setup can exceed the unchanged sampling bound. That first
+    # delayed snapshot correctly records a gap and cannot establish a counter
+    # baseline. Always take another fresh rule-only snapshot before canaries.
+    interval = observe(lab, observations, 'after_interval')
+    require(interval['current_evaluation']['telemetry_valid']
+            and interval['current_evaluation']['policy_matches']
+            and critical(interval)['id'] == before['critical_incident_id'],
+            'Fresh rule interval did not preserve the unresolved incident: ' + evaluation_diagnostic(interval))
     final = observe(lab, observations, 'after_canaries', monitoring.CANARIES)
     require(final['current_evaluation']['status'] == 'healthy'
             and all(a['severity'] == 'info' for a in final['alerts'] if a['state'] == 'open'),
-            'Fresh committed checks did not establish recovered monitoring.')
+            'Fresh committed checks did not establish recovered monitoring: ' + evaluation_diagnostic(final))
     journal = request({'command': 'export'})
-    require(journal.get('ok') is True and len(journal['rows']) == 8
+    require(journal.get('ok') is True and len(journal['rows']) == 9
             and store.encoded(journal['rows'][:5]) == store.encoded(before['journal']['rows']), 'Final history lost the preboot prefix.')
     resolutions = [e for e in journal['events'] if e['key'] == CRITICAL and e['action'] == 'resolved']
     require(len(resolutions) == 1 and resolutions[0]['phase'] == 'after_canaries'
-            and resolutions[0]['sequence'] == 8, 'The original incident resolved before fresh committed recovery.')
+            and resolutions[0]['sequence'] == 9, 'The original incident resolved before fresh committed recovery.')
     inventory(lab, observations, 'after')
     captured = lab.stop_captures()
     require(captured['routed_flows_verified'] == 3, 'Postboot capture coverage is incomplete.')
