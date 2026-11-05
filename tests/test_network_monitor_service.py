@@ -9,6 +9,7 @@ import sys
 import tempfile
 import time
 import unittest
+from unittest.mock import Mock, patch
 
 from scripts import network_monitor as monitor
 from scripts import network_monitor_service as service
@@ -16,6 +17,42 @@ from scripts import network_monitor_store as store
 from test_network_monitor import ruleset, count, response
 
 ROOT = Path(__file__).resolve().parents[1]
+
+
+class SocketFramingTests(unittest.TestCase):
+    def connection(self, chunks):
+        connection = Mock()
+        connection.recv.side_effect = [*chunks, b""]
+        return connection
+
+    def test_large_json_frame_is_accepted_across_many_chunk_boundaries(self):
+        expected = {"text": "x" * (4 * 1024 * 1024), "escaped": "first\nsecond"}
+        data = (store.encoded(expected) + "\n").encode()
+        chunks = [data[index:index + 65536] for index in range(0, len(data), 65536)]
+        connection = self.connection(chunks)
+        self.assertEqual(service.receive(connection, len(data)), expected)
+        self.assertEqual(connection.recv.call_count, len(chunks))
+
+    def test_split_terminator_is_accepted_and_embedded_second_frame_is_rejected(self):
+        self.assertEqual(service.receive(self.connection([b'{"ok":', b'true}', b'\n']), 100), {"ok": True})
+        for chunks in ([b'{"ok":true}\n{}\n'], [b'{"ok":', b'true}\n{}'], [b'{}\n\n']):
+            with self.subTest(chunks=chunks), self.assertRaisesRegex(ValueError, "One request"):
+                service.receive(self.connection(chunks), 100)
+
+    def test_byte_bound_and_incomplete_frame_are_still_rejected(self):
+        with self.assertRaisesRegex(ValueError, "size limit"):
+            service.receive(self.connection([b'{"ok":true}\n']), 11)
+        with self.assertRaisesRegex(ValueError, "complete response"):
+            service.receive(self.connection([b'{"ok":true}']), 100)
+
+    def test_deadline_is_not_extended_by_chunk_progress(self):
+        connection = self.connection([b'{"ok":', b'true}\n'])
+        tick = Mock()
+        with patch.object(service.time, "monotonic", side_effect=[9.0, 10.0]):
+            with self.assertRaisesRegex(TimeoutError, "deadline"):
+                service.receive(connection, 100, deadline=10.0, tick=tick)
+        self.assertEqual(connection.recv.call_count, 1)
+        tick.assert_called_once()
 
 
 def now():

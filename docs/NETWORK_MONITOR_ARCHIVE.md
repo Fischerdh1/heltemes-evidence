@@ -6,7 +6,7 @@ This opt-in lab stores older monitoring observations in numbered archive segment
 
 The original journal stops at 256 observations. The archive format moves complete prefixes into private JSON segment files, then continues the same history in SQLite. Existing journals retain their original format and limits; starting the archive format requires explicit initialization of a new private state directory.
 
-Normal operation retains a bounded current monitoring state rather than every prior evaluation in memory. Status returns current incidents and a bounded recent event list with explicit truncation metadata. Full history remains available through an offline export, reconstructed from all verified segments and active rows. The small socket export keeps its 16 MiB response limit; the offline exporter streams complete rows and their events without that transport limit.
+Normal operation retains a bounded current monitoring state rather than every prior evaluation in memory. Status returns current incidents and a bounded recent event list with explicit truncation metadata. Full history remains available through an offline export, reconstructed from all verified segments and active rows. The archive format refuses full-history socket exports so that report generation cannot occupy the live monitor beyond its short request deadline. The offline exporter streams complete rows and their events; legacy journals retain their existing small socket export.
 
 Retention is finite. The default archive format permits at most 4,096 rows in 16 segments of 256 rows and at most 128 MiB of archived bytes. The VM exercise uses 128-row segments and a matching 2,048-row ceiling; the active database also has a 64 MiB limit. Row, segment, byte, and probe budgets are explicit. Reaching a budget or failing persistence stops acceptance and reports unknown coverage; the monitor does not silently delete old history or initialize a new archive. The one-second sampling interval is an exercise setting, not a production recommendation.
 
@@ -44,7 +44,7 @@ The acceptance sequence is:
 4. Retry an observation already moved into an archive. It must return its original sequence without appending another row.
 5. Repair the synthetic firewall. Require fresh complete connection checks before resolving the original incident.
 6. Reject missing and changed archive files on separate disposable state copies.
-7. Verify source identity, raw archive bytes, journal history, capture evidence, and cleanup before publishing the report.
+7. Save the live final status, stop the monitor, and export its verified history offline. Require the exported head to match the captured status. Verify source identity, raw archive bytes, journal history, capture evidence, and cleanup before publishing the report.
 
 To export a larger disposable archive, stop its monitor first, then run the following inside that disposable environment with its synthetic state path and a new output file:
 

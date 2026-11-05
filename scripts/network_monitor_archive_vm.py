@@ -77,7 +77,10 @@ class DisposableVM(reboot.DisposableVM):
     def guest(self, stage):
         require(stage in {'exercise', 'cleanup'}, 'Unknown archive guest stage.')
         result = self.ssh('sudo -n python3 -I -S -B ' + GUEST_SCRIPT + ' ' + stage + ' --token ' + self.token,
-                          timeout=600 if stage == 'exercise' else 60)
+                          timeout=600 if stage == 'exercise' else 60, check=False)
+        if result.returncode:
+            error = (result.stderr or result.stdout).decode(errors='replace')[-12 * 1024:]
+            raise RuntimeError('A disposable archive guest operation failed: ' + self.redact(error).strip())
         require(len(result.stdout) <= 1024 * 1024, 'Guest stage metadata exceeds its bound.')
         value = json.loads(result.stdout)
         require(isinstance(value, dict) and value.get('ok') is True, 'The archive guest stage failed.')
@@ -118,8 +121,12 @@ def validate_same_guest(before, after):
 def validate_lifecycle(report):
     require(report['format'] == 'heltemes-monitor-archive-guest' and report['version'] == 1
             and report['ok'] is True and report['boot_enabled_configuration_only'] is True
-            and report['services_stopped_after_exercise'] is True and report['network_cleanup']['ok'] is True,
+            and report['services_stopped_after_exercise'] is True and report['network_cleanup']['ok'] is True
+            and report['journal_export_method'] == 'stopped_verified_journal',
             'Guest completion or scope differs.')
+    stopped = report['monitor_stopped_for_export']
+    require(stopped['ActiveState'] == 'inactive' and stopped['MainPID'] == 0
+            and stopped['UnitFileState'] == 'enabled', 'Offline history export did not stop the writer.')
     require(report['configuration'] == {'segment_rows': 128, 'max_rows': 2048, 'max_segments': 16,
             'interval_seconds': 1.0, 'canary_every': 16, 'max_cycles': 320, 'finish_after_healthy_cycle': 270, 'freshness_seconds': 20},
             'Archive exercise configuration differs.')

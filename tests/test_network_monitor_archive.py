@@ -157,6 +157,33 @@ class ArchiveTests(unittest.TestCase):
             self.assertEqual(result["current_status"]["current_evaluation"]["status"], "unknown")
             self.assertEqual(journal.total_count, 33)
 
+    def test_live_archive_export_is_rejected_without_building_history_or_changing_freshness(self):
+        self.initialize(segment_rows=32, max_rows=512)
+        elapsed = [0.0]
+        with archive.ArchiveJournal(self.state) as journal, \
+                patch.object(service, "utc_now", lambda: (self.fixture.time + timedelta(seconds=1)).isoformat()), \
+                patch.object(service.time, "monotonic", lambda: elapsed[0]):
+            running = service.Service(journal, freshness_seconds=20)
+            for index, rows in enumerate(((), archive.monitor.CANARIES), 1):
+                observation, _ = self.observation(rows=rows)
+                elapsed[0] += 2
+                running.dispatch({"command": "observe", "request_id": "live-" + str(index), "observation": observation})
+            before = journal.export()
+            accepted = copy.deepcopy(running.last_accepted)
+            live = running.status()
+            self.assertEqual(live["current_evaluation"]["status"], "healthy")
+            with patch.object(journal, "export", side_effect=AssertionError("history must not be built")) as export:
+                result = running.dispatch({"command": "export"})
+            export.assert_not_called()
+            self.assertFalse(result["ok"])
+            self.assertEqual(result["error"], "offline_export_required")
+            self.assertIn("offline archive export", result["message"])
+            self.assertEqual(journal.export(), before)
+            self.assertEqual(running.last_accepted, accepted)
+            self.assertEqual(running.status(), live)
+            self.assertFalse(live["history_summary"]["socket_export_available"])
+            self.assertTrue(live["history_summary"]["full_history_available_in_offline_export"])
+
     def test_incident_occurrence_and_event_identity_continue_across_archive_boundary(self):
         self.initialize(segment_rows=32, max_rows=512)
         with archive.ArchiveJournal(self.state) as journal:

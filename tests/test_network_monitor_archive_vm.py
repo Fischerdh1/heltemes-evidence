@@ -6,6 +6,7 @@ import json
 from pathlib import Path
 import tarfile
 import tempfile
+import subprocess
 import unittest
 from unittest.mock import patch
 
@@ -106,7 +107,8 @@ def archive_fixture():
     final = copy.deepcopy(stages['recovered']['status'])
     report = {'format': 'heltemes-monitor-archive-guest', 'version': 1, 'ok': True,
         'boot_enabled_configuration_only': True, 'services_stopped_after_exercise': True,
-        'network_cleanup': {'ok': True}, 'boot': {'boot_id': BOOT},
+        'network_cleanup': {'ok': True}, 'boot': {'boot_id': BOOT}, 'journal_export_method': 'stopped_verified_journal',
+        'monitor_stopped_for_export': {'ActiveState': 'inactive', 'MainPID': 0, 'UnitFileState': 'enabled'},
         'configuration': {'segment_rows': 128, 'max_rows': 2048, 'max_segments': 16, 'interval_seconds': 1.0,
                           'canary_every': 16, 'max_cycles': 320, 'finish_after_healthy_cycle': 270, 'freshness_seconds': 20},
         'stages': stages, 'critical_incident_id': incident, 'collector_receipts': records, 'crashes': crashes,
@@ -204,6 +206,45 @@ class ArchiveHostTests(unittest.TestCase):
                 lab.validate_same_guest(*pair)
 
 
+    def test_guest_validation_binds_source_boot_original_report_and_capture_bytes(self):
+        report, segments = archive_fixture()
+        files = {name: b'public synthetic test bytes' for name in lab.GUEST_FILES}
+        files.update(segments)
+        source = {'source_sha256': {name: 'c' * 64 for name in lab.SOURCE_FILES}}
+        report['source_sha256'] = {name: source['source_sha256'][name] for name in lab.GUEST_SOURCE_FILES}
+        report['capture_sha256'] = {name: hashlib.sha256(raw).hexdigest() for name, raw in files.items()
+                                   if name.endswith(('.pcap', '-packets.txt'))}
+        raw = lab.canonical(report); files['GUEST.json'] = raw
+        summary = {'boot_id': BOOT, 'guest_report_sha256': hashlib.sha256(raw).hexdigest(),
+                   'committed_count': len(report['journal']['rows']), 'current_status': 'healthy'}
+        args = (raw, files, source, *boot_pair(), summary)
+        lab.validate_guest(*args)
+        changes = (
+            lambda a: a[1].update({'GUEST.json': b'replaced report'}),
+            lambda a: a[1].update({'user.pcap': b'replaced capture'}),
+            lambda a: a[2]['source_sha256'].update({lab.GUEST_SOURCE_FILES[0]: 'd' * 64}),
+            lambda a: a[5].update(boot_id='another boot'),
+            lambda a: a[5].update(guest_report_sha256='0' * 64),
+        )
+        for index, change in enumerate(changes):
+            bad = list(copy.deepcopy(args)); change(bad)
+            with self.subTest(index=index), self.assertRaises(RuntimeError):
+                lab.validate_guest(*bad)
+
+    def test_guest_failure_retains_bounded_diagnostics_and_redacts_private_transport(self):
+        vm = lab.DisposableVM({})
+        vm.directory = self.directory
+        message = 'x' * 15000 + ' failed_checks:same_collector_process ' + vm.token + ' ' + str(self.directory)
+        result = subprocess.CompletedProcess([], 1, stdout=b'', stderr=message.encode())
+        with patch.object(vm, 'ssh', return_value=result) as ssh:
+            with self.assertRaises(RuntimeError) as caught:
+                vm.guest('exercise')
+        self.assertIn('failed_checks:same_collector_process', str(caught.exception))
+        self.assertNotIn(vm.token, str(caught.exception))
+        self.assertNotIn(str(self.directory), str(caught.exception))
+        self.assertLess(len(str(caught.exception)), 12500)
+        self.assertFalse(ssh.call_args.kwargs['check'])
+
     def test_complete_archive_lifecycle_and_original_segments_are_accepted(self):
         report, files = archive_fixture()
         lab.validate_lifecycle(report)
@@ -237,6 +278,7 @@ class ArchiveHostTests(unittest.TestCase):
             lambda r: r['archived_duplicate']['after_status']['freshness'].update(last_accepted_request_id='old'),
             lambda r: r['refusal_checks']['original_state_sha256_after'].update(db='changed'),
             lambda r: r['refusal_checks']['cases'][0].update(rejected=False),
+            lambda r: r['monitor_stopped_for_export'].update(MainPID=100),
             lambda r: r['collector_receipts'][10].update(cycle=50),
         )
         for index, mutate in enumerate(mutations):

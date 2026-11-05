@@ -132,6 +132,7 @@ def initialize(value, approved, *, segment_rows=256, max_rows=MAX_ROWS, max_arch
 
 class ArchiveJournal:
     _validate_observation = staticmethod(store.Journal._validate_observation)
+    offline_export_required = True
 
     def __init__(self, value):
         self.path = store.state_path(value)
@@ -428,7 +429,7 @@ class ArchiveJournal:
                 "history_summary": {"complete": False, "resolved_alerts_total": self.engine.resolved_count,
                     "resolved_alerts_retained": sum(item["state"] == "resolved" for item in self.engine.alerts),
                     "event_ids_per_alert_limit": EVENT_REFERENCES, "full_history_available_in_offline_export": True,
-                    "socket_export_byte_limit": 16 * 1024 * 1024},
+                    "socket_export_available": False},
                 "archives": {"enabled": True, "segment_rows": self.identity["segment_rows"],
                     "active_rows": len(self.rows), "sealed_segments": len(self.segments),
                     "archived_rows": sum(item[3] for item in self.segments), "archive_bytes": self.archive_bytes,

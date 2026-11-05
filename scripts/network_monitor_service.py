@@ -52,9 +52,12 @@ def receive(connection, limit, *, deadline=None, tick=None):
             continue
         if not part:
             raise ValueError("Connection closed before a complete response.")
+        # Every earlier chunk was already checked. Scanning only the new bytes
+        # avoids repeatedly copying and scanning a growing response buffer.
+        newline = part.find(b"\n")
+        store.require(newline in (-1, len(part) - 1), "One request per connection is required.")
         value.extend(part)
         store.require(len(value) <= limit, "Socket message exceeds size limit.")
-        store.require(b"\n" not in value[:-1], "One request per connection is required.")
     return store.parse(value)
 
 
@@ -184,6 +187,9 @@ class Service:
             return {"ok": True, **self.status()}
         if command == "export":
             store.require(set(payload) == {"command"}, "Unexpected export fields.")
+            if getattr(self.journal, "offline_export_required", False):
+                return {"ok": False, "error": "offline_export_required",
+                        "message": "Stop the monitor and use the offline archive export command."}
             status = self.status()
             return {"ok": True, **self.journal.export(), "current_status": status}
         store.require(command == "observe" and set(payload) in (

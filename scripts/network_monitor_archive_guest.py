@@ -108,11 +108,88 @@ def request(name):
 
 
 def diagnostics():
+    """Read only two owned units, bounded fields and logs; never read environment or credentials."""
     values = {}
+    fields = ('ActiveState', 'SubState', 'MainPID', 'NRestarts', 'ExecMainCode', 'ExecMainStatus', 'Result')
     for unit in (MONITOR_UNIT, COLLECTOR_UNIT):
-        result = command(['journalctl', '--no-pager', '--output=cat', '--lines=12', '--unit=' + unit], check=False, timeout=5)
-        values[unit] = automatic.sanitize_diagnostic(result.stdout)
+        record = {}
+        try:
+            properties = command(['systemctl', 'show', '--no-pager', '--property=' + ','.join(fields), unit],
+                                 check=False, timeout=5)
+            record['service'] = {key: automatic.sanitize_diagnostic(value) for line in properties.stdout.splitlines()
+                                 if '=' in line for key, value in [line.split('=', 1)] if key in fields}
+            logs = command(['journalctl', '--no-pager', '--output=cat', '--lines=12', '--unit=' + unit], check=False, timeout=5)
+            record['recent_log'] = automatic.sanitize_diagnostic(logs.stdout)
+        except (OSError, ValueError, RuntimeError, subprocess.SubprocessError):
+            record['diagnostic_unavailable'] = True
+        values[unit] = record
     return values
+
+
+def collector_diagnostic(request_id):
+    """Describe three fixed disposable files without exposing observations or identifiers."""
+    result = {}
+    specifications = (('runtime.json', 4096), ('allocation.json', 1024), ('pending.json', store.MAX_REQUEST))
+    for name, limit in specifications:
+        path = PRIVATE / name
+        record = {'exists': path.exists() or path.is_symlink()}
+        if record['exists']:
+            try:
+                store.state_path(PRIVATE)
+                info = reboot.ordinary(path)
+                require(info.st_size < limit, 'Oversized collector diagnostic file.')
+                value = store.parse(path.read_bytes())
+                require(isinstance(value, dict), 'Invalid collector diagnostic file.')
+                record['bytes'] = info.st_size
+                for key in ('process_id', 'cycle', 'cycles', 'next_port', 'committed_sequence'):
+                    if key in value:
+                        record[key] = value[key] if type(value[key]) is int else None
+                if name == 'runtime.json':
+                    record['state'] = value.get('state') if value.get('state') in ('collecting', 'idle') else 'unrecognized'
+                if name == 'pending.json':
+                    payload = value.get('request')
+                    identity = payload.get('request_id') if isinstance(payload, dict) else None
+                    require(isinstance(identity, str) and len(identity) <= 128, 'Invalid pending identity.')
+                    record['request_id_sha256'] = hashlib.sha256(identity.encode()).hexdigest()
+                    record['matches_boundary_request'] = identity == request_id
+            except (OSError, ValueError, RuntimeError, TypeError):
+                record['diagnostic_unavailable'] = True
+        result[name] = record
+    return result
+
+
+def validate_recovery(before, marker, managed, recovered, after, incident, recovery_elapsed_seconds=None):
+    """Keep every recovery invariant strict and report which exact observation failed."""
+    def critical_ids(status):
+        return [item['id'] for item in status['alerts'] if item['key'] == reboot.CRITICAL and item['state'] == 'open']
+    checks = {
+        'exactly_one_monitor_restart': after['monitor_manager']['NRestarts'] == managed['NRestarts'] + 1,
+        'same_collector_process': after['collector_manager']['MainPID'] == before['collector_manager']['MainPID'],
+        'wait_result_preserves_incident': critical_ids(recovered) == [incident],
+        'snapshot_preserves_incident': critical_ids(after['status']) == [incident],
+        'wait_and_snapshot_same_monitor': recovered['process_id'] == after['status']['process_id'],
+    }
+    if all(checks.values()):
+        return
+    evidence = {
+        'failed_checks': [name for name, passed in checks.items() if not passed],
+        'boundary_sequence': marker['head_sequence'],
+        'recovery_elapsed_seconds': recovery_elapsed_seconds,
+        'collector_state': collector_diagnostic(marker['request_id']),
+        'monitor_restart_counts': {'before_snapshot': before['monitor_manager']['NRestarts'],
+                                  'at_boundary': managed['NRestarts'], 'after_snapshot': after['monitor_manager']['NRestarts']},
+        'monitor_pids': {'before_snapshot': before['status']['process_id'], 'boundary': marker['process_id'],
+                         'wait_result': recovered['process_id'], 'after_snapshot': after['status']['process_id']},
+        'collector_pids': {'before_snapshot': before['collector_manager']['MainPID'],
+                          'after_snapshot': after['collector_manager']['MainPID']},
+        'collector_restart_counts': {'before_snapshot': before['collector_manager']['NRestarts'],
+                                    'after_snapshot': after['collector_manager']['NRestarts']},
+        'committed_counts': {'wait_result': recovered['committed_count'], 'after_snapshot': after['status']['committed_count']},
+        'critical_ids': {'expected': [incident], 'wait_result': critical_ids(recovered),
+                         'after_snapshot': critical_ids(after['status'])},
+        'bounded_unit_diagnostics': diagnostics(),
+    }
+    raise RuntimeError('Supervisor recovery or incident continuity differs: ' + json.dumps(evidence, sort_keys=True))
 
 
 def wait_status(predicate, timeout=45):
@@ -232,23 +309,27 @@ def crash_rollover(point, number, started, incident):
             'Archive crash marker does not match the intended durable boundary.')
     require(marker['active_sql_rows'] == (SEGMENT_ROWS if point == POINTS[0] else 0), 'Archive pruning boundary differs.')
     ARM.unlink(); store.sync_directory(RUNTIME)
+    recovery_started = time.monotonic()
     command(['systemctl', 'kill', '--kill-who=main', '--signal=KILL', MONITOR_UNIT])
     recovered = wait_status(lambda s: s['process_id'] != marker['process_id'] and s['committed_count'] > marker['head_sequence'])
     after = snapshot(started)
-    require(after['monitor_manager']['NRestarts'] == managed['NRestarts'] + 1
-            and after['collector_manager']['MainPID'] == before['collector_manager']['MainPID']
-            and reboot.critical(recovered)['id'] == incident, 'Supervisor recovery or incident continuity differs.')
+    recovery_elapsed = time.monotonic() - recovery_started
+    validate_recovery(before, marker, managed, recovered, after, incident, recovery_elapsed)
     BOUNDARY.unlink(); store.sync_directory(RUNTIME)
     return {'before': before, 'boundary': marker, 'worker_stopped_observed': True, 'worker_process_state': 'T',
-            'after': after, 'response_received_before_crash': False}
+            'after': after, 'response_received_before_crash': False, 'recovery_elapsed_seconds': recovery_elapsed}
+
+
+def read_receipt(path):
+    reboot.ordinary(path)
+    require(path.stat().st_size < store.MAX_REQUEST, 'Oversized archive receipt.')
+    return store.parse(path.read_bytes())
 
 
 def receipts():
     result = []
     for path in sorted(PRIVATE.glob('receipt-[0-9][0-9][0-9][0-9].json')):
-        reboot.ordinary(path)
-        require(path.stat().st_size < store.MAX_REQUEST, 'Oversized archive receipt.')
-        result.append(store.parse(path.read_bytes()))
+        result.append(read_receipt(path))
     require(MIN_OBSERVATIONS <= len(result) <= collector.MAX_CYCLES, 'Archive observation inventory differs.')
     return result
 
@@ -328,6 +409,46 @@ def refusal_checks():
             'original_reverified_count': total}
 
 
+def stage_call(name, action):
+    require(name in ('live_retry_status', 'live_archived_retry', 'stop_monitor_for_export', 'offline_verified_export',
+                     'collector_receipt_inventory', 'receipt_history_verification', 'capture_validation', 'archive_refusal_checks'),
+            'Unknown archive completion stage.')
+    try:
+        return action()
+    except (OSError, ValueError, RuntimeError, KeyError, TypeError, subprocess.SubprocessError) as error:
+        raise RuntimeError('Archive stage ' + name + ' failed: ' + str(error)) from error
+
+
+def offline_export(final, stopped_manager):
+    require(stopped_manager['ActiveState'] == 'inactive' and stopped_manager['MainPID'] == 0,
+            'Complete history export requires the monitor to be stopped.')
+    with archive.ArchiveJournal(STATE) as verified:
+        require(verified.total_count == final['committed_count'] and verified.head_digest == final['head_digest'],
+                'Offline verified head differs from the last live monitor status.')
+        exported = verified.export()
+    require(len(exported['rows']) == final['committed_count']
+            and exported['rows'][-1]['row_digest'] == final['head_digest'], 'Offline export changed the accepted head.')
+    return {'ok': True, **exported, 'current_status': final}
+
+
+def retry_and_stop(first):
+    """Complete the live retry and freshness checks before any expensive full-history export."""
+    before_retry = stage_call('live_retry_status', lambda: request('status'))
+    # Exact retry of an actual producer request; the harness creates no observation.
+    retry = stage_call('live_archived_retry', lambda: service.request(STATE, first['request']))
+    after_retry = stage_call('live_retry_status', lambda: request('status'))
+    require(retry.get('ok') is True and retry['duplicate'] is True and retry['committed_sequence'] == first['committed_sequence']
+            and retry['evaluation'] == first['evaluation'] and before_retry['committed_count'] == after_retry['committed_count'],
+            'An archived retry changed history or its original result.')
+    final = stage_call('live_retry_status', lambda: request('status'))
+    require(final['current_evaluation']['status'] == 'healthy', 'Final live canary coverage is no longer fresh.')
+    stage_call('stop_monitor_for_export', lambda: command(['systemctl', 'stop', MONITOR_UNIT], timeout=30))
+    stopped_manager = manager(MONITOR_UNIT)
+    journal = stage_call('offline_verified_export', lambda: offline_export(final, stopped_manager))
+    duplicate = {'request': first['request'], 'before_status': before_retry, 'result': retry, 'after_status': after_retry}
+    return journal, final, duplicate, stopped_manager
+
+
 def run_exercise(lab):
     started = time.monotonic()
     lab.setup(); lab.start_services(); lab.apply_policy()
@@ -350,27 +471,20 @@ def run_exercise(lab):
     command(['systemctl', 'stop', COLLECTOR_UNIT], timeout=30)
     stages['recovered'] = snapshot(started)
     require(stages['recovered']['status']['current_evaluation']['status'] == 'healthy', 'Fresh canary recovery was not preserved at stop.')
-    journal, records = request('export'), receipts()
-    lab.probes = validate_inventory(journal, records, crashes)
+    first = read_receipt(PRIVATE / 'receipt-0002.json')
+    require(first['cycle'] == 1 and first['committed_sequence'] == 2, 'First autonomous receipt differs.')
+    journal, final, duplicate, stopped_manager = retry_and_stop(first)
+    records = stage_call('collector_receipt_inventory', receipts)
+    lab.probes = stage_call('receipt_history_verification', lambda: validate_inventory(journal, records, crashes))
     require(len(journal['rows']) == len(records) + 3, 'Journal must contain exactly three monitor startup boundaries.')
     resolutions = [e for e in journal['events'] if e['key'] == reboot.CRITICAL and e['action'] == 'resolved']
     require(len(resolutions) == 1 and resolutions[0]['alert_id'] == incident and resolutions[0]['sequence'] > 256,
             'Critical incident recovery was not uniquely recorded after both archive handoffs.')
     resolution = journal['rows'][resolutions[0]['sequence'] - 1]
     require(len(resolution['sample']['probes']) == 3 and resolution['evaluation']['status'] == 'healthy', 'Recovery lacked fresh full canaries.')
-    first = records[0]
-    before_retry = request('status')
-    # Exact retry of an actual producer request; the harness creates no observation.
-    retry = service.request(STATE, first['request'])
-    after_retry = request('status')
-    require(retry.get('ok') is True and retry['duplicate'] is True and retry['committed_sequence'] == first['committed_sequence']
-            and retry['evaluation'] == first['evaluation'] and before_retry['committed_count'] == after_retry['committed_count'],
-            'An archived retry changed history or its original result.')
-    captured = lab.stop_captures()
+    captured = stage_call('capture_validation', lab.stop_captures)
     require(captured['routed_flows_verified'] == len([p for p in lab.probes if p['from'] != p['to']]), 'Packet coverage differs.')
-    final = request('status')
-    command(['systemctl', 'stop', MONITOR_UNIT], timeout=30)
-    checks = refusal_checks()
+    checks = stage_call('archive_refusal_checks', refusal_checks)
     segments = []
     for index, name in enumerate(ARCHIVE_FILES, 1):
         source = STATE / 'archives' / f'segment-{index:06d}.json'
@@ -380,7 +494,8 @@ def run_exercise(lab):
     require(len(list((STATE / 'archives').glob('segment-*.json'))) == 2, 'Exactly two archived segments were expected.')
     return {'approved_policy': approved, 'stages': stages, 'crashes': crashes, 'collector_receipts': records,
             'journal': journal, 'final_status': final, 'critical_incident_id': incident, 'capture': captured,
-            'archived_duplicate': {'request': first['request'], 'before_status': before_retry, 'result': retry, 'after_status': after_retry},
+            'archived_duplicate': duplicate, 'journal_export_method': 'stopped_verified_journal',
+            'monitor_stopped_for_export': stopped_manager,
             'refusal_checks': checks, 'archive_files': segments,
             'configuration': {'segment_rows': SEGMENT_ROWS, 'max_rows': MAX_ROWS, 'max_segments': 16,
                               'interval_seconds': collector.INTERVAL, 'canary_every': collector.CANARY_EVERY,
