@@ -31,6 +31,8 @@ The [network lab](NETWORK_LAB.md) is an additional implementation milestone conf
 
 The [DNS and TLS expansion](NETWORK_SERVICES_LAB.md) adds explicit name resolution, certificate-hostname and issuer checks, and a firewall-denied TLS scenario with a healthy-service control. Each run has its own source-bound report, packet evidence, temporary-key cleanup, and acceptance result. This advances the networking stage while AWS remains deferred.
 
+The [segmentation expansion](NETWORK_SEGMENTATION.md) adds user, application, and management networks with a twelve-case access matrix. It verifies scoped return traffic, denied new connections, a deliberately permissive exception, repair, and packet observations on both sides of the router. Its acceptance is tied to the particular hosted run and inspected artifact.
+
 ## Proposed stages
 
 | Planning window | Engineering work | Evidence required | What Fischer should be able to do |

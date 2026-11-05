@@ -2,7 +2,7 @@
 
 The `reviewer` job in `Verify project` runs after both Python test jobs, Terraform validation, and the isolated Linux network lab succeed. It creates a fresh synthetic archive, runs the existing 12-phase demonstration, packages the source and results, and retains a downloadable artifact for 30 days. A new run has its own identifiers and timestamps. The network lab retains its own packet capture and policy observations. See [the network lab guide](NETWORK_LAB.md) for that separate report.
 
-The required `network_lab` job runs both the routing/firewall exercise and the [DNS/TLS exercise](NETWORK_SERVICES_LAB.md). Each has a separate artifact. A successful first exercise does not establish that the entire job passed; verify both exercise results and the final job status. DNS/TLS uploads exclude temporary private keys and use the same 30-day retention period.
+The required `network_lab` job runs the routing/firewall exercise, the [DNS/TLS exercise](NETWORK_SERVICES_LAB.md), and the [segmentation exercise](NETWORK_SEGMENTATION.md). Each has a separate artifact. A successful earlier exercise does not establish that the entire job passed; verify all three results and the final job status. DNS/TLS uploads exclude temporary private keys. All three artifacts use the same 30-day retention period.
 
 ## Inspect a run
 
