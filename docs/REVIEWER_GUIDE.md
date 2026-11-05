@@ -18,6 +18,8 @@ This is one security-engineering project with two case studies: evidence integri
 
 The downloadable reviewer bundle also includes an offline `index.html`, the exact source, a passing demo report, and a file-hash manifest. A manifest detects changes relative to a trusted copy; it is not an independent attestation or trusted timestamp.
 
+For proposed changes, the `reviewer` CI job produces a fresh package and public source-comparison record after the other required jobs pass. See [continuous verification](CONTINUOUS_VERIFICATION.md) for the exact commit, run, download, and 30-day retention workflow. Use the job's recorded outcome when assessing a particular change.
+
 ## Reproduce it
 
 Requirements: macOS or Linux, Python 3.11 or later, and OpenSSH `/usr/bin/ssh-keygen` with Ed25519 signing/verification support. The demo uses the Python standard library. Windows and other environments have not been verified for this edition.
