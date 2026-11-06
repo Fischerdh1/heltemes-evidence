@@ -134,13 +134,113 @@ def request(name):
 
 
 def diagnostics():
+    """Bounded read-only failure facts, never observation payloads or credentials."""
     result = {}
+    fields = ('LoadState', 'ActiveState', 'SubState', 'MainPID', 'NRestarts', 'ExecMainCode',
+              'ExecMainStatus', 'Result', 'FragmentPath', 'MemoryCurrent', 'CPUUsageNSec')
     for unit in (MONITOR_UNIT, COLLECTOR_UNIT):
+        record = {}
         try:
-            result[unit] = automatic.sanitize_diagnostic(command(
+            output = command(['systemctl', 'show', '--no-pager', '--property=' + ','.join(fields), unit], check=False, timeout=5).stdout
+            properties = {key: automatic.sanitize_diagnostic(value) for line in output.splitlines() if '=' in line
+                          for key, value in [line.split('=', 1)] if key in fields}
+            record['service'] = properties
+            raw = dict(line.split('=', 1) for line in output.splitlines() if '=' in line)
+            pid = raw.get('MainPID', '')
+            if pid.isdecimal() and 1 < int(pid) < 4194304 and raw.get('FragmentPath') == str(unit_path(unit)):
+                record['process'] = process_diagnostic(int(pid))
+            record['recent_log'] = automatic.sanitize_diagnostic(command(
                 ['journalctl', '--no-pager', '--output=cat', '--lines=12', '--unit=' + unit], check=False, timeout=5).stdout)
-        except (OSError, subprocess.SubprocessError):
-            result[unit] = 'unavailable'
+        except (OSError, ValueError, RuntimeError, subprocess.SubprocessError):
+            record['unavailable'] = True
+        result[unit] = record
+    result['collector_state'] = collector_diagnostic()
+    result['archive_state'] = archive_diagnostic()
+    return result
+
+
+def process_diagnostic(pid):
+    require(type(pid) is int and 1 < pid < 4194304, 'Invalid owned process identity.')
+    result = {'process_id': pid}
+    try:
+        process = Path('/proc') / str(pid)
+        with (process / 'status').open() as stream:
+            raw = stream.read(16385)
+        require(len(raw) <= 16384, 'Oversized process status.')
+        fields = ('State', 'PPid', 'Threads', 'VmRSS')
+        result['status'] = {key: value.strip()[:80] for line in raw.splitlines() if ':' in line
+                            for key, value in [line.split(':', 1)] if key in fields}
+        with (process / 'wchan').open() as stream:
+            wait = stream.read(129).strip()
+        result['wait_channel'] = wait if len(wait) <= 128 and re.fullmatch(r'[A-Za-z0-9_]+', wait) else 'unavailable'
+    except (OSError, ValueError, RuntimeError):
+        result['unavailable'] = True
+    return result
+
+
+def collector_diagnostic():
+    result = {}
+    specifications = (('runtime.json', 4096), ('allocation.json', 1024),
+                      ('pending.json', store.MAX_REQUEST), ('transport.json', 4096))
+    integers = ('process_id', 'delivery_process_id', 'process_cycle', 'cycle', 'cycles', 'next_port',
+                'committed_sequence', 'attempts', 'errno', 'stop_after_cycle')
+    for name, limit in specifications:
+        path = PRIVATE / name
+        record = {'exists': path.exists() or path.is_symlink()}
+        if record['exists']:
+            try:
+                value = read_private(path, limit)
+                require(isinstance(value, dict), 'Invalid collector diagnostic object.')
+                record['bytes'] = path.stat().st_size
+                record['sha256'] = hashlib.sha256(path.read_bytes()).hexdigest()
+                record.update({key: value[key] for key in integers if type(value.get(key)) is int})
+                if type(value.get('deadline_exceeded')) is bool:
+                    record['deadline_exceeded'] = value['deadline_exceeded']
+                for key in ('state', 'phase', 'error_type', 'reason'):
+                    text = value.get(key)
+                    if isinstance(text, str) and re.fullmatch(r'[A-Za-z0-9_]{1,64}', text):
+                        record[key] = text
+                payload = value.get('request')
+                if isinstance(payload, dict):
+                    identity = payload.get('request_id')
+                    if isinstance(identity, str) and len(identity) <= 128:
+                        record['request_id_sha256'] = hashlib.sha256(identity.encode()).hexdigest()
+            except (OSError, ValueError, RuntimeError, KeyError, TypeError):
+                record['unavailable'] = True
+        result[name] = record
+    return result
+
+
+def archive_diagnostic():
+    """Read small database metadata with a one-second lock deadline; no replay."""
+    result, connection = {}, None
+    try:
+        database = STATE / 'monitor.sqlite3'
+        info = reboot.ordinary(database)
+        require(info.st_size <= store.MAX_BYTES, 'Oversized diagnostic database.')
+        result['database_bytes'] = info.st_size
+        connection = sqlite3.connect(database.as_uri() + '?mode=ro', uri=True, timeout=1)
+        connection.execute('BEGIN')
+        config = connection.execute('SELECT head_sequence,head_digest,archived_sequence,archived_digest FROM config WHERE id=1').fetchone()
+        require(config is not None, 'Missing diagnostic journal head.')
+        result.update(dict(zip(('head_sequence', 'head_digest', 'archived_sequence', 'archived_digest'), config)))
+        active = connection.execute('SELECT COUNT(*),MIN(sequence),MAX(sequence) FROM observations').fetchone()
+        result['active_rows'], result['first_active_sequence'], result['last_active_sequence'] = active
+        segments = connection.execute('SELECT COUNT(*),MAX(last_sequence),SUM(byte_count) FROM segments').fetchone()
+        result['sealed_segments'], result['last_archived_sequence'], result['archive_bytes'] = segments
+        connection.close(); connection = None
+        names = []
+        for index, path in enumerate((STATE / 'archives').iterdir()):
+            require(index < archive.MAX_SEGMENTS + 1, 'Archive diagnostic inventory exceeds bound.')
+            require(re.fullmatch(r'segment-[0-9]{6}\.json(?:\.pending)?', path.name), 'Unexpected diagnostic archive filename.')
+            item = reboot.ordinary(path)
+            names.append({'name': path.name, 'bytes': item.st_size})
+        result['archive_files'] = sorted(names, key=lambda item: item['name'])
+    except (OSError, ValueError, RuntimeError, sqlite3.Error):
+        result['unavailable'] = True
+    finally:
+        if connection is not None:
+            connection.close()
     return result
 
 
@@ -220,6 +320,7 @@ def install(approved, names, boot_id):
 def wait_collector_complete(phase):
     target = collector.BEFORE_STOP_CYCLE if phase == 'before' else collector.AFTER_STOP_CYCLE
     deadline = time.monotonic() + (target if phase == 'before' else target - collector.BEFORE_STOP_CYCLE) * 1.6 + 45
+    next_manager_check = time.monotonic()
     while time.monotonic() < deadline:
         path = PRIVATE / 'runtime.json'
         if path.exists():
@@ -233,6 +334,14 @@ def wait_collector_complete(phase):
                 require(allocation == {'cycles': target, 'next_port': collector.PORT_START + collector.PORT_BLOCK * target},
                         'Durable source port allocation differs from completed cycles.')
                 return runtime, allocation
+        if time.monotonic() >= next_manager_check:
+            managed = {unit: manager(unit) for unit in (MONITOR_UNIT, COLLECTOR_UNIT)}
+            invalid = [unit for unit, value in managed.items() if value['NRestarts'] != 0 or value['ActiveState'] == 'failed'
+                       or (unit == MONITOR_UNIT and value['ActiveState'] != 'active')]
+            if invalid:
+                raise RuntimeError('A supervised service failed or restarted during the required single-instance phase: '
+                                   + json.dumps(diagnostics(), sort_keys=True))
+            next_manager_check = time.monotonic() + 5
         time.sleep(0.1)
     raise RuntimeError('Autonomous collector completion timed out: ' + json.dumps(diagnostics(), sort_keys=True))
 

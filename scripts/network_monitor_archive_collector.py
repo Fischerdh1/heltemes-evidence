@@ -36,6 +36,23 @@ def canary_cycle(cycle):
     return cycle == 2 or (cycle > 2 and cycle % CANARY_EVERY == 0)
 
 
+def transport_diagnostic(error):
+    """Return bounded categories, never arbitrary exception text or paths."""
+    known = {'Connection closed before a complete response.': 'incomplete_response',
+             'One request per connection is required.': 'multiple_frames',
+             'Socket message exceeds size limit.': 'response_size_limit',
+             'State path is too long for the private Unix socket.': 'socket_path_limit',
+             'Private monitor socket identity is invalid.': 'socket_identity',
+             'Request exceeds size limit.': 'request_size_limit',
+             'Duplicate JSON object key.': 'duplicate_json_key',
+             'Nonfinite JSON value.': 'nonfinite_json'}
+    reason = 'timeout' if isinstance(error, TimeoutError) else known.get(str(error),
+             'os_error' if isinstance(error, OSError) else 'invalid_response')
+    number = getattr(error, 'errno', None)
+    return {'error_type': type(error).__name__[:64], 'errno': number if type(number) is int else None,
+            'reason': reason}
+
+
 class Allocation(ordinary.Allocation):
     def reserve(self):
         value = {'next_port': PORT_START, 'cycles': 0}
@@ -105,7 +122,8 @@ class Collector:
                 break
             except (OSError, ValueError) as error:
                 failures.append(type(error).__name__)
-                require(time.monotonic() < deadline, 'Archive service retry deadline exceeded; pending evidence is retained.')
+                require(time.monotonic() < deadline, 'Archive service retry deadline exceeded; pending evidence is retained: '
+                        + store.encoded({'cycle': pending['cycle'], 'attempts': attempts, **transport_diagnostic(error)}))
                 time.sleep(0.2)
         receipt = {**pending, 'committed_sequence': result['committed_sequence'], 'evaluation': result['evaluation'],
                    'duplicate_acknowledgement': result['duplicate'], 'delivery_attempts': attempts,

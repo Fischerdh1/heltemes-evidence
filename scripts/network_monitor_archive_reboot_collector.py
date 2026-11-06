@@ -70,6 +70,23 @@ def private_json(path, *, limit=store.MAX_REQUEST):
     return store.parse(path.read_bytes())
 
 
+def transport_diagnostic(error):
+    """Categorize bounded transport failures without copying arbitrary error text."""
+    known = {'Connection closed before a complete response.': 'incomplete_response',
+             'One request per connection is required.': 'multiple_frames',
+             'Socket message exceeds size limit.': 'response_size_limit',
+             'State path is too long for the private Unix socket.': 'socket_path_limit',
+             'Private monitor socket identity is invalid.': 'socket_identity',
+             'Request exceeds size limit.': 'request_size_limit',
+             'Duplicate JSON object key.': 'duplicate_json_key',
+             'Nonfinite JSON value.': 'nonfinite_json'}
+    category = type(error).__name__
+    reason = 'timeout' if isinstance(error, TimeoutError) else known.get(str(error),
+             'os_error' if isinstance(error, OSError) else 'invalid_response')
+    number = getattr(error, 'errno', None)
+    return {'error_type': category[:64], 'errno': number if type(number) is int else None, 'reason': reason}
+
+
 class Allocation(ordinary.Allocation):
     """One lifetime lock and one durable global port reservation across boots."""
     def read(self):
@@ -158,7 +175,13 @@ class Collector:
                 break
             except (OSError, ValueError) as error:
                 failures.append(type(error).__name__)
-                require(time.monotonic() < deadline, 'Archived-reboot retry deadline exceeded; pending evidence is retained.')
+                expired = time.monotonic() >= deadline
+                diagnostic = {'cycle': pending['cycle'], 'attempts': attempts, 'deadline_exceeded': expired,
+                              **transport_diagnostic(error)}
+                if attempts == 1 or expired:
+                    ordinary.replace_private(self.allocation.directory / 'transport.json', diagnostic)
+                require(not expired, 'Archived-reboot retry deadline exceeded; pending evidence is retained: '
+                        + store.encoded(diagnostic))
                 time.sleep(0.2)
         receipt = {**pending, 'committed_sequence': result['committed_sequence'], 'evaluation': result['evaluation'],
                    'duplicate_acknowledgement': result['duplicate'], 'delivery_attempts': attempts,

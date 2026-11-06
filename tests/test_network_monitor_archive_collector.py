@@ -104,6 +104,28 @@ class ArchiveCollectorTests(unittest.TestCase):
         self.assertEqual(json.loads(worker.pending.read_text()), pending)
         self.assertEqual(list(self.directory.glob('receipt-*.json')), [])
 
+    def test_retry_failure_categories_do_not_include_private_exception_text(self):
+        import errno
+        value = collector.transport_diagnostic(PermissionError(errno.EACCES, 'private value', '/private/key'))
+        self.assertEqual(value, {'error_type': 'PermissionError', 'errno': errno.EACCES, 'reason': 'os_error'})
+        self.assertEqual(collector.transport_diagnostic(ValueError('Connection closed before a complete response.'))['reason'],
+                         'incomplete_response')
+        self.assertEqual(collector.transport_diagnostic(ValueError('private response'))['reason'], 'invalid_response')
+
+    def test_retry_deadline_reports_stuck_cycle_without_changing_payload_or_timeout(self):
+        worker = collector.Collector(self.lab(), self.allocation(), state=self.directory)
+        pending = worker.prepare()
+        with patch.object(collector.service, 'request', side_effect=TimeoutError('private text')) as request, \
+             patch.object(collector.time, 'monotonic', side_effect=[10.0, 56.0]):
+            with self.assertRaisesRegex(RuntimeError, '"reason":"timeout"') as caught:
+                worker.collect()
+        request.assert_called_once_with(worker.state, pending['request'], timeout=3)
+        self.assertNotIn('private text', str(caught.exception))
+        self.assertIn('"cycle":1', str(caught.exception))
+        self.assertIn('"attempts":1', str(caught.exception))
+        self.assertEqual(json.loads(worker.pending.read_text()), pending)
+        self.assertEqual(list(self.directory.glob('receipt-*.json')), [])
+
     def test_valid_receipt_survives_crash_before_pending_removal(self):
         worker = collector.Collector(self.lab(), self.allocation(), state=self.directory)
         pending = worker.prepare()

@@ -126,6 +126,30 @@ class ArchivedRebootCollectorTests(unittest.TestCase):
         self.assertTrue(receipt['duplicate_acknowledgement'])
         self.assertFalse(worker.pending.exists())
 
+    def test_retry_diagnostic_has_only_bounded_categories_not_private_error_text(self):
+        import errno
+        diagnostic = collector.transport_diagnostic(PermissionError(errno.EACCES, 'private token value', '/private/key'))
+        self.assertEqual(diagnostic, {'error_type': 'PermissionError', 'errno': errno.EACCES, 'reason': 'os_error'})
+        self.assertEqual(collector.transport_diagnostic(ValueError('Connection closed before a complete response.'))['reason'],
+                         'incomplete_response')
+        self.assertEqual(collector.transport_diagnostic(ValueError('arbitrary private response'))['reason'], 'invalid_response')
+
+    def test_retry_deadline_retains_pending_and_reports_stuck_cycle_and_reason(self):
+        worker = self.worker()
+        pending = worker.prepare()
+        # Inject elapsed time, not a longer production request timeout.
+        with patch.object(collector.service, 'request', side_effect=TimeoutError('private text')) as request, \
+             patch.object(collector.time, 'monotonic', side_effect=[10.0, 56.0]):
+            with self.assertRaisesRegex(RuntimeError, '"reason":"timeout"') as caught:
+                worker.collect()
+        request.assert_called_once_with(worker.state, pending['request'], timeout=3)
+        self.assertNotIn('private text', str(caught.exception))
+        self.assertEqual(json.loads(worker.pending.read_text()), pending)
+        diagnostic = json.loads((self.directory / 'transport.json').read_text())
+        self.assertEqual(diagnostic, {'cycle': 1, 'attempts': 1, 'deadline_exceeded': True,
+                                     'error_type': 'TimeoutError', 'errno': None, 'reason': 'timeout'})
+        self.assertEqual(list(self.directory.glob('receipt-*.json')), [])
+
     def test_preboot_run_completes_exact_durable_boundary_with_no_pending(self):
         worker = self.worker()
         collector.ordinary.replace_private(worker.allocation.path, {'cycles': 269, 'next_port': 43614})

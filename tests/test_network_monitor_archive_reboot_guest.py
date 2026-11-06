@@ -2,8 +2,10 @@
 import copy
 import hashlib
 import importlib.util
+import io
 import os
 from pathlib import Path
+import subprocess
 import tempfile
 import unittest
 from unittest.mock import patch
@@ -97,6 +99,67 @@ class GuestContractTests(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, 'unexpectedly changed'):
                 guest.archived_retry(first)
 
+    def test_failure_diagnostics_read_only_owned_unit_fields_and_bounded_logs(self):
+        def command(arguments, **kwargs):
+            if arguments[0] == 'systemctl':
+                output = 'MainPID=1\nNRestarts=7\nActiveState=active\nSecretEnvironment=must-not-appear\n'
+            else:
+                output = ('retry deadline private /var/private/secret ' + 'a' * 64 + '\n') * 20
+            return subprocess.CompletedProcess(arguments, 0, output, '')
+        with patch.object(guest, 'command', side_effect=command) as run, \
+             patch.object(guest, 'collector_diagnostic', return_value={'bounded': True}), \
+             patch.object(guest, 'archive_diagnostic', return_value={'head_sequence': 128}), \
+             patch.object(guest, 'process_diagnostic') as process:
+            result = guest.diagnostics()
+        self.assertEqual(run.call_count, 4)
+        process.assert_not_called()
+        for unit in (guest.MONITOR_UNIT, guest.COLLECTOR_UNIT):
+            self.assertNotIn('SecretEnvironment', result[unit]['service'])
+            self.assertLessEqual(len(result[unit]['recent_log'].splitlines()), 12)
+            self.assertNotIn('/var/private/secret', result[unit]['recent_log'])
+            self.assertNotIn('a' * 64, result[unit]['recent_log'])
+        self.assertTrue(all(call.kwargs['timeout'] == 5 for call in run.call_args_list))
+
+    def test_process_diagnostic_reads_no_environment_or_command_line(self):
+        raw = 'Name:\tpython3\nState:\tS (sleeping)\nPPid:\t1\nThreads:\t1\nVmRSS:\t20120 kB\nSecret:\tomit\n'
+        with patch.object(Path, 'open', side_effect=[io.StringIO(raw), io.StringIO('unix_stream_read_generic')]) as opened:
+            result = guest.process_diagnostic(234)
+        self.assertEqual(opened.call_count, 2)
+        self.assertEqual(result['wait_channel'], 'unix_stream_read_generic')
+        self.assertEqual(set(result['status']), {'State', 'PPid', 'Threads', 'VmRSS'})
+        with self.assertRaisesRegex(RuntimeError, 'process identity'):
+            guest.process_diagnostic(1)
+
+    def test_collector_failure_metadata_omits_payload_and_arbitrary_error_text(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            pending = {'cycle': 127, 'process_id': 234, 'request': {'request_id': 'archive-private-id',
+                       'observation': {'private_payload': 'must-not-appear'}}}
+            guest.store.write_new(root / 'pending.json', guest.store.encoded(pending).encode())
+            guest.store.write_new(root / 'transport.json', guest.store.encoded({'cycle': 127, 'attempts': 15,
+                'deadline_exceeded': True, 'error_type': 'TimeoutError', 'errno': None, 'reason': 'timeout',
+                'exception_text': 'secret /private/path'}).encode())
+            with patch.object(guest, 'PRIVATE', root), patch.object(guest.reboot, 'ordinary', side_effect=lambda p, **kw: p.stat()):
+                result = guest.collector_diagnostic()
+        self.assertEqual(result['pending.json']['cycle'], 127)
+        self.assertEqual(result['pending.json']['request_id_sha256'], hashlib.sha256(b'archive-private-id').hexdigest())
+        self.assertEqual(result['transport.json']['reason'], 'timeout')
+        self.assertTrue(result['transport.json']['deadline_exceeded'])
+        encoded = guest.store.encoded(result)
+        for omitted in ('must-not-appear', 'private_payload', 'archive-private-id', 'secret /private/path'):
+            self.assertNotIn(omitted, encoded)
+
+    def test_collection_wait_fails_promptly_on_restart_instead_of_repeating_invalid_run(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            def manager(unit):
+                return {'NRestarts': int(unit == guest.COLLECTOR_UNIT), 'ActiveState': 'active'}
+            with patch.object(guest, 'PRIVATE', Path(temporary)), patch.object(guest, 'manager', side_effect=manager), \
+                 patch.object(guest, 'diagnostics', return_value={'pending_cycle': 127}), patch.object(guest.time, 'sleep') as sleep:
+                with self.assertRaisesRegex(RuntimeError, 'single-instance phase') as caught:
+                    guest.wait_collector_complete('before')
+            self.assertIn('pending_cycle', str(caught.exception))
+            sleep.assert_not_called()
+
 
 class ReplayAcrossRestartTests(unittest.TestCase):
     """One finite synthetic fixture exercises the real journal, service and collector."""
@@ -187,6 +250,21 @@ class ReplayAcrossRestartTests(unittest.TestCase):
         self.assertEqual(self.snapshot['rows'][-1]['request']['kind'], 'restart')
         self.assertEqual(self.snapshot['head_sequence'], 272)
         self.assertEqual(self.database_before_read, self.database_after_read)
+
+    def test_failure_database_diagnostics_read_bounded_metadata_without_replay_or_mutation(self):
+        database = self.state / 'monitor.sqlite3'
+        before = database.read_bytes()
+        with patch.object(guest, 'STATE', self.state), patch.object(guest.reboot, 'ordinary', side_effect=lambda p, **kw: p.stat()), \
+             patch.object(guest.archive, 'ArchiveJournal') as replay:
+            result = guest.archive_diagnostic()
+        replay.assert_not_called()
+        self.assertEqual(result['head_sequence'], 402)
+        self.assertEqual(result['archived_sequence'], 384)
+        self.assertEqual(result['active_rows'], 18)
+        self.assertEqual(result['sealed_segments'], 3)
+        self.assertEqual(len(result['archive_files']), 3)
+        self.assertEqual(database.read_bytes(), before)
+        self.assertNotIn('rows', result)
 
     def test_restart_resets_counter_reference_and_only_fresh_canaries_resolve_original_incident(self):
         first, second, canaries = self.records[270:273]
