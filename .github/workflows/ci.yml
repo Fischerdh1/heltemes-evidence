@@ -498,9 +498,75 @@ jobs:
           cat work/monitor-archive-reboot/publish/SUMMARY.md >> "$GITHUB_STEP_SUMMARY"
           printf '\n[Download archive monitoring evidence](%s)\n' "$ARTIFACT_URL" >> "$GITHUB_STEP_SUMMARY"
 
+  monitor_archive_powercut:
+    needs: [python]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@e797f83bcb11b83ae66e0230d6156d7c80228e7c # v6.0.0
+        with:
+          python-version: '3.14'
+      - name: Install disposable guest VM tools
+        run: |
+          sudo apt-get update
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y qemu-system-x86 qemu-utils cloud-image-utils openssh-client curl
+      - name: Exercise archived history through abrupt guest power loss
+        env:
+          REVIEWER_PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          mkdir -p work
+          python3 -I -S -B scripts/network_monitor_archive_powercut_vm.py --output work/monitor-archive-powercut
+      - name: Retain archived history power-loss evidence
+        id: archive_powercut_evidence
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: monitor-archive-powercut-${{ github.sha }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            work/monitor-archive-powercut/publish/REPORT.json
+            work/monitor-archive-powercut/publish/VM.json
+            work/monitor-archive-powercut/publish/SUMMARY.md
+            work/monitor-archive-powercut/publish/MANIFEST.json
+            work/monitor-archive-powercut/publish/BEFORE.json
+            work/monitor-archive-powercut/publish/BEFORE-HISTORY.json
+            work/monitor-archive-powercut/publish/AFTER-STAGING.json
+            work/monitor-archive-powercut/publish/AFTER-STAGING-HISTORY.json
+            work/monitor-archive-powercut/publish/AFTER-FILE.json
+            work/monitor-archive-powercut/publish/AFTER-FILE-HISTORY.json
+            work/monitor-archive-powercut/publish/AFTER.json
+            work/monitor-archive-powercut/publish/AFTER-HISTORY.json
+            work/monitor-archive-powercut/publish/APPROVED_POLICY.json
+            work/monitor-archive-powercut/publish/monitor.service
+            work/monitor-archive-powercut/publish/before-user.pcap
+            work/monitor-archive-powercut/publish/before-user-packets.txt
+            work/monitor-archive-powercut/publish/before-app.pcap
+            work/monitor-archive-powercut/publish/before-app-packets.txt
+            work/monitor-archive-powercut/publish/before-management.pcap
+            work/monitor-archive-powercut/publish/before-management-packets.txt
+            work/monitor-archive-powercut/publish/after-user.pcap
+            work/monitor-archive-powercut/publish/after-user-packets.txt
+            work/monitor-archive-powercut/publish/after-app.pcap
+            work/monitor-archive-powercut/publish/after-app-packets.txt
+            work/monitor-archive-powercut/publish/after-management.pcap
+            work/monitor-archive-powercut/publish/after-management-packets.txt
+            work/monitor-archive-powercut/publish/archive-segment-000001.json
+            work/monitor-archive-powercut/publish/archive-segment-000002.json
+            work/monitor-archive-powercut/publish/archive-segment-000003.json
+            work/monitor-archive-powercut/publish/archive-segment-000004.json
+          if-no-files-found: error
+          retention-days: 30
+      - name: Show archived history power-loss results
+        env:
+          ARTIFACT_URL: ${{ steps.archive_powercut_evidence.outputs.artifact-url }}
+        run: |
+          cat work/monitor-archive-powercut/publish/SUMMARY.md >> "$GITHUB_STEP_SUMMARY"
+          printf '\n[Download archive power-loss evidence](%s)\n' "$ARTIFACT_URL" >> "$GITHUB_STEP_SUMMARY"
+
   reviewer:
     if: ${{ always() }}
-    needs: [python, terraform, network_lab, monitor_reboot, monitor_powercut, monitor_automatic, monitor_archive, monitor_archive_reboot]
+    needs: [python, terraform, network_lab, monitor_reboot, monitor_powercut, monitor_automatic, monitor_archive, monitor_archive_reboot, monitor_archive_powercut]
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
@@ -511,9 +577,9 @@ jobs:
           python3 - <<'PY'
           import json, os
           results = json.loads(os.environ['PREREQUISITE_RESULTS'])
-          expected = {'python', 'terraform', 'network_lab', 'monitor_reboot', 'monitor_powercut', 'monitor_automatic', 'monitor_archive', 'monitor_archive_reboot'}
+          expected = {'python', 'terraform', 'network_lab', 'monitor_reboot', 'monitor_powercut', 'monitor_automatic', 'monitor_archive', 'monitor_archive_reboot', 'monitor_archive_powercut'}
           if set(results) != expected or any(value.get('result') != 'success' for value in results.values()):
-              raise SystemExit('Reviewer blocked: every prerequisite, including VM reboot, abrupt virtual power loss, automatic missing-data recovery, history archiving, and archived-history full reboot, must succeed.')
+              raise SystemExit('Reviewer blocked: every prerequisite, including VM reboot, abrupt virtual power loss, automatic missing-data recovery, history archiving, archived-history full reboot, and archived-history abrupt power loss, must succeed.')
           PY
       - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
         with:
