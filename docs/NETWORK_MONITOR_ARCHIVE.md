@@ -23,6 +23,8 @@ An interrupted temporary write can be rebuilt only when it is an exact prefix of
 
 The collector saves its pending request before sending it. After a lost reply, it retries those exact bytes and receives the original result. A duplicate does not refresh telemetry freshness. Restart still records a coverage gap and requires fresh observations.
 
+Duplicate lookup retains at most one verified segment in memory to avoid repeatedly decoding and re-encoding an entire archive while acknowledging the same saved request. Every lookup still reads the protected file and checks its size and SHA-256 fingerprint against the complete segment descriptor. A changed, missing, linked, or improperly protected file is refused even when a cached result exists. Exported records and returned results cannot modify the private lookup cache. Request and retry deadlines remain bounded.
+
 The implementation uses SQLite's `synchronous=EXTRA` setting with rollback-journal mode, file synchronization, and directory synchronization. These are explicit durability mechanisms, not a claim that hashes make storage immune to an administrator. See [SQLite atomic commit](https://www.sqlite.org/atomiccommit.html) and [synchronous settings](https://www.sqlite.org/pragma.html#pragma_synchronous).
 
 ## Repeatable VM exercise

@@ -130,6 +130,136 @@ class ArchiveTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "conflicts"):
                 journal.append("original", altered, 999)
 
+    def test_boundary_retry_after_reopen_reuses_verified_parse_without_renewing_freshness(self):
+        self.initialize(segment_rows=32, max_rows=512)
+        with archive.ArchiveJournal(self.state) as journal:
+            self.fill(journal, 32)
+            boundary = copy.deepcopy(journal.last_row)
+        with archive.ArchiveJournal(self.state) as journal, \
+                patch.object(service, "utc_now", lambda: (self.fixture.time + timedelta(seconds=1)).isoformat()):
+            self.assertIsNone(journal._duplicate_segment_cache)
+            running = service.Service(journal, freshness_seconds=20)
+            payload = {"command": "observe", "request_id": boundary["request_id"],
+                       "observation": boundary["request"]["observation"]}
+            original_head = (journal.total_count, journal.head_digest)
+            with patch.object(journal, "_read_segment", wraps=journal._read_segment) as parser:
+                first = running.dispatch(payload)
+                self.assertEqual(parser.call_count, 1)
+            # Model the expensive segment parser being unavailable after the
+            # first reply was lost. Exact retries still recheck file bytes.
+            with patch.object(journal, "_read_segment", side_effect=AssertionError("whole segment decoded again")), \
+                    patch.object(archive.store, "parse", side_effect=AssertionError("JSON decoded again")), \
+                    patch.object(archive.store, "read_private", wraps=archive.store.read_private) as read:
+                second = running.dispatch(payload)
+                third = running.dispatch(payload)
+            self.assertEqual(read.call_count, 2)
+            for result in (first, second, third):
+                self.assertTrue(result["duplicate"] and result["result_is_historical"])
+                self.assertEqual(result["committed_sequence"], boundary["sequence"])
+                self.assertEqual(result["evaluation"], boundary["evaluation"])
+                self.assertEqual(result["events"], boundary["events"])
+                self.assertIsNone(result["current_status"]["freshness"]["last_accepted_request_id"])
+                self.assertEqual(result["current_status"]["current_evaluation"]["status"], "unknown")
+            self.assertEqual((journal.total_count, journal.head_digest), original_head)
+
+    def test_cached_duplicate_rechecks_current_bytes_and_file_identity_on_every_retry(self):
+        self.initialize(segment_rows=32, max_rows=512)
+        with archive.ArchiveJournal(self.state) as journal:
+            self.fill(journal, 32)
+            original = copy.deepcopy(journal.last_row)
+            path = journal.archive_path / "segment-000001.json"
+            raw, times = path.read_bytes(), path.stat()
+            request = (original["request_id"], original["request"]["observation"], 999)
+            journal.append(*request)
+            accepted_head = (journal.total_count, journal.head_digest)
+            extra = self.base / "unsafe-archive-link"
+            for variant in ("same_size_same_mtime", "missing", "permissions", "symlink", "hardlink"):
+                with self.subTest(variant=variant):
+                    try:
+                        if variant == "same_size_same_mtime":
+                            path.write_bytes(b" " + raw[1:])
+                            os.utime(path, ns=(times.st_atime_ns, times.st_mtime_ns))
+                            self.assertEqual(path.stat().st_size, len(raw))
+                            self.assertEqual(path.stat().st_mtime_ns, times.st_mtime_ns)
+                        elif variant == "missing":
+                            path.unlink()
+                        elif variant == "permissions":
+                            path.chmod(0o644)
+                        elif variant == "symlink":
+                            store.write_new(extra, raw)
+                            path.unlink(); path.symlink_to(extra)
+                        else:
+                            os.link(path, extra)
+                        with self.assertRaises((ValueError, OSError)):
+                            journal.append(*request)
+                        self.assertEqual((journal.total_count, journal.head_digest), accepted_head)
+                    finally:
+                        if path.exists() or path.is_symlink():
+                            path.unlink()
+                        if extra.exists():
+                            extra.unlink()
+                        store.write_new(path, raw)
+                    self.assertTrue(journal.append(*request)["duplicate"])
+
+    def test_duplicate_cache_cannot_be_poisoned_by_lookup_result_or_export_mutation(self):
+        self.initialize(segment_rows=32, max_rows=512)
+        with archive.ArchiveJournal(self.state) as journal:
+            self.fill(journal, 32)
+            original = copy.deepcopy(journal.last_row)
+            request = (original["request_id"], original["request"]["observation"], 999)
+            expected = journal.append(*request)
+            selected = journal._find_request(original["request_id"])
+            selected["evaluation"]["status"] = "poisoned"
+            selected["request"]["observation"]["phase"] = "poisoned"
+            selected["events"].append({"poisoned": True})
+            returned = journal.append(*request)
+            self.assertEqual(returned, expected)
+            returned["evaluation"]["status"] = "poisoned"
+            exported = journal.export()
+            exported["rows"][-1]["evaluation"]["status"] = "poisoned"
+            exported["rows"][-1]["request"]["observation"]["phase"] = "poisoned"
+            iterated = list(journal.iter_rows())
+            iterated[-1]["events"].append({"poisoned": True})
+            self.assertEqual(journal.append(*request), expected)
+            altered = copy.deepcopy(request[1]); altered["phase"] = "conflicting retry"
+            with self.assertRaisesRegex(ValueError, "conflicts"):
+                journal.append(request[0], altered, 999)
+
+    def test_duplicate_cache_is_one_segment_bound_to_full_descriptor_and_database_identity(self):
+        self.initialize(segment_rows=32, max_rows=512)
+        with archive.ArchiveJournal(self.state) as journal:
+            self.fill(journal, 64)
+            with patch.object(journal, "_read_segment", wraps=journal._read_segment) as parser:
+                journal._find_request("sample-1")
+                self.assertEqual(parser.call_count, 1)
+                self.assertEqual(len(journal._duplicate_segment_cache[1]), 32)
+                journal._find_request("sample-2")
+                self.assertEqual(parser.call_count, 1)
+                journal._find_request("sample-64")
+                self.assertEqual(parser.call_count, 2)
+                self.assertEqual(journal._duplicate_segment_cache[0][1][0], 2)
+                self.assertEqual(len(journal._duplicate_segment_cache[1]), 32)
+                journal._find_request("sample-1")
+                self.assertEqual(parser.call_count, 3)
+                descriptor = journal.segments[0]
+                journal.segments[0] = (*descriptor[:-1], "0" * 64)
+                with self.assertRaisesRegex(ValueError, "envelope"):
+                    journal._find_request("sample-1")
+                self.assertEqual(parser.call_count, 4)
+                journal.segments[0] = descriptor
+                identity = journal.identity["database_id"]
+                journal.identity["database_id"] = "e" * 32
+                with self.assertRaisesRegex(ValueError, "envelope"):
+                    journal._find_request("sample-1")
+                self.assertEqual(parser.call_count, 5)
+                journal.identity["database_id"] = identity
+                # A failed new cache key never overwrites the verified entry.
+                journal._find_request("sample-2")
+                self.assertEqual(parser.call_count, 5)
+        with archive.ArchiveJournal(self.state) as reopened:
+            self.assertIsNone(reopened._duplicate_segment_cache)
+            self.assertEqual(reopened._find_request("sample-1")["sequence"], 1)
+
     def test_last_row_survives_empty_active_segment_for_service_restart(self):
         self.initialize(segment_rows=32, max_rows=512)
         with archive.ArchiveJournal(self.state) as journal:

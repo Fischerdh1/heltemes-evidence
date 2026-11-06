@@ -35,6 +35,7 @@ VOLATILE = Path('/run/heltemes-archive-reboot-marker')
 MONITOR_UNIT = 'heltemes-archive-reboot-monitor.service'
 COLLECTOR_UNIT = 'heltemes-archive-reboot-collector.service'
 FRESHNESS, SEGMENT_ROWS, MAX_ROWS = 20, 128, 2048
+ROOT_UID = 0
 SOURCE_FILES = (*reboot.SOURCE_FILES, 'scripts/network_monitor_collector.py',
                 'scripts/network_monitor_automatic_guest.py', 'scripts/network_monitor_archive.py',
                 'scripts/network_monitor_archive_collector.py',
@@ -107,8 +108,88 @@ def file_proof(path):
             'mode': stat.S_IMODE(info.st_mode), 'uid': info.st_uid, 'nlink': info.st_nlink}
 
 
+def runtime_metadata(info):
+    return {'device': info.st_dev, 'inode': info.st_ino, 'uid': info.st_uid,
+            'mode': stat.S_IMODE(info.st_mode), 'nlink': info.st_nlink, 'bytes': info.st_size,
+            'mtime_ns': info.st_mtime_ns, 'ctime_ns': info.st_ctime_ns}
+
+
+def check_runtime_metadata(info):
+    # Zero links is never accepted. It is classified separately only so a
+    # proven replacement can retry a new pathname instead of reading the old fd.
+    require(stat.S_ISREG(info.st_mode) and info.st_uid == ROOT_UID and stat.S_IMODE(info.st_mode) == 0o600
+            and info.st_nlink in (0, 1) and 0 <= info.st_size <= 4096,
+            'Unsafe collector_runtime metadata: ' + store.encoded(runtime_metadata(info)))
+
+
+def runtime_replaced(path, held, named):
+    identity = lambda info: (info.st_dev, info.st_ino)
+    if held.st_nlink == 0 or named.st_nlink == 0:
+        # A pathname lookup can itself finish on the just-retired inode.
+        # Require a fresh, linked replacement before retrying that case.
+        current = path.lstat()
+        check_runtime_metadata(current)
+        require(current.st_nlink == 1 and identity(current) != identity(held),
+                'Detached collector_runtime inode without a proven linked replacement: ' + store.encoded(runtime_metadata(current)))
+        return True
+    return identity(held) != identity(named)
+
+
+def read_runtime_snapshot(path):
+    require(path == PRIVATE / 'runtime.json', 'Only collector_runtime supports atomic replacement snapshots.')
+    for unused in range(3):
+        try:
+            fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+        except OSError as error:
+            raise RuntimeError('Collector_runtime could not be opened safely; errno=' + str(error.errno)) from error
+        try:
+            opened, named = os.fstat(fd), path.lstat()
+            check_runtime_metadata(opened); check_runtime_metadata(named)
+            if runtime_replaced(path, opened, named):
+                continue
+            require(opened.st_nlink == named.st_nlink == 1,
+                    'Detached collector_runtime inode without a proven replacement: ' + store.encoded(runtime_metadata(opened)))
+            chunks, size = [], 0
+            while size <= 4096:
+                part = os.read(fd, 4097 - size)
+                if not part:
+                    break
+                chunks.append(part); size += len(part)
+            after, latest = os.fstat(fd), path.lstat()
+            check_runtime_metadata(after); check_runtime_metadata(latest)
+            if runtime_replaced(path, after, latest):
+                continue
+            require(after.st_nlink == latest.st_nlink == 1 and runtime_metadata(opened) == runtime_metadata(after)
+                    and runtime_metadata(named) == runtime_metadata(latest) and size == after.st_size <= 4096,
+                    'Collector_runtime changed in place or has unsafe identity: ' + store.encoded(runtime_metadata(after)))
+            return store.parse(b''.join(chunks))
+        finally:
+            os.close(fd)
+    raise RuntimeError('Collector_runtime pathname changed during all three bounded snapshot attempts.')
+
+
+def private_label(path):
+    fixed = {PRIVATE / name: 'collector_' + name.removesuffix('.json') for name in
+             ('runtime.json', 'allocation.json', 'pending.json', 'transport.json')}
+    fixed.update({PUBLISH / name: 'published_' + name.removesuffix('.json').lower().replace('-', '_')
+                  for name in ('BEFORE.json', 'BEFORE-HISTORY.json')})
+    if path in fixed:
+        return fixed[path]
+    return 'collector_receipt' if path.parent == PRIVATE and re.fullmatch(r'receipt-[0-9]{4}\.json', path.name) else 'private_record'
+
+
 def read_private(path, limit=store.MAX_REQUEST):
-    info = reboot.ordinary(path)
+    if path == PRIVATE / 'runtime.json':
+        require(limit == 4096, 'Collector_runtime has a fixed snapshot byte limit.')
+        return read_runtime_snapshot(path)
+    try:
+        info = reboot.ordinary(path)
+    except (OSError, RuntimeError) as error:
+        try:
+            details = runtime_metadata(path.lstat())
+        except OSError:
+            details = {'metadata_unavailable': True}
+        raise RuntimeError('Owned file check failed for ' + private_label(path) + ': ' + store.encoded(details)) from error
     require(info.st_size <= limit, 'Oversized private exercise record.')
     return store.parse(path.read_bytes())
 

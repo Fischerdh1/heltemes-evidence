@@ -7,6 +7,7 @@ import os
 from pathlib import Path
 import subprocess
 import tempfile
+from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
 
@@ -159,6 +160,131 @@ class GuestContractTests(unittest.TestCase):
                     guest.wait_collector_complete('before')
             self.assertIn('pending_cycle', str(caught.exception))
             sleep.assert_not_called()
+
+
+class RuntimeSnapshotTests(unittest.TestCase):
+    def setUp(self):
+        temporary = tempfile.TemporaryDirectory(prefix='runtime-snapshot-test-')
+        self.addCleanup(temporary.cleanup)
+        self.directory = Path(temporary.name)
+        self.path = self.directory / 'runtime.json'
+        guest.store.write_new(self.path, b'{"cycle":1}\n')
+        self.replacements = 0
+        self.addCleanup(patch.stopall)
+        patch.object(guest, 'PRIVATE', self.directory).start()
+        patch.object(guest, 'ROOT_UID', os.geteuid()).start()
+
+    def replace(self, content=b'{"cycle":2}\n'):
+        self.replacements += 1
+        new = self.directory / ('replacement-' + str(self.replacements))
+        guest.store.write_new(new, content)
+        os.replace(new, self.path)
+
+    def test_opened_inode_unlinked_before_fstat_retries_new_path_and_never_reads_retired_file(self):
+        real = os.fstat
+        calls = []
+        def fstat(fd):
+            calls.append(fd)
+            if len(calls) == 1:
+                self.replace()
+                self.assertEqual(real(fd).st_nlink, 0)
+            return real(fd)
+        with patch.object(guest.os, 'fstat', side_effect=fstat), patch.object(guest.os, 'read', wraps=os.read) as read:
+            result = guest.read_private(self.path, 4096)
+        self.assertEqual(result, {'cycle': 2})
+        self.assertEqual(read.call_count, 2)  # New stable contents and its EOF only.
+        self.assertEqual(self.path.stat().st_nlink, 1)
+        for fd in calls:
+            with self.assertRaises(OSError):
+                real(fd)
+
+    def test_replacement_during_read_discards_old_bytes_and_requires_new_stable_snapshot(self):
+        real = os.read
+        changed = False
+        def read(fd, size):
+            nonlocal changed
+            value = real(fd, size)
+            if not changed:
+                changed = True; self.replace()
+            return value
+        with patch.object(guest.os, 'read', side_effect=read):
+            self.assertEqual(guest.read_private(self.path, 4096), {'cycle': 2})
+
+    def test_path_lookup_on_same_retired_inode_requires_fresh_linked_replacement(self):
+        real_fstat, real_lstat = os.fstat, Path.lstat
+        retired, named_reads = None, 0
+        def fstat(fd):
+            nonlocal retired
+            if retired is None:
+                self.replace(); retired = real_fstat(fd)
+                self.assertEqual(retired.st_nlink, 0)
+            return real_fstat(fd)
+        def lstat():
+            nonlocal named_reads
+            named_reads += 1
+            return retired if named_reads == 1 else real_lstat(self.path)
+        with patch.object(guest.os, 'fstat', side_effect=fstat), patch.object(Path, 'lstat', side_effect=lstat):
+            self.assertEqual(guest.read_private(self.path, 4096), {'cycle': 2})
+        self.assertGreaterEqual(named_reads, 3)
+
+    def test_persistently_detached_same_inode_is_refused_without_reading(self):
+        info = self.path.stat()
+        values = {name: getattr(info, name) for name in ('st_dev', 'st_ino', 'st_uid', 'st_mode', 'st_size', 'st_mtime_ns', 'st_ctime_ns')}
+        retired = SimpleNamespace(**values, st_nlink=0)
+        with patch.object(guest.os, 'fstat', return_value=retired), patch.object(Path, 'lstat', return_value=retired), \
+             patch.object(guest.os, 'read') as read:
+            with self.assertRaisesRegex(RuntimeError, 'without a proven linked replacement'):
+                guest.read_private(self.path, 4096)
+        read.assert_not_called()
+
+    def test_in_place_modification_is_rejected_without_retry(self):
+        real = os.read
+        changed = False
+        def read(fd, size):
+            nonlocal changed
+            value = real(fd, size)
+            if not changed:
+                changed = True; self.path.write_bytes(b'{"cycle":12345}\n')
+            return value
+        with patch.object(guest.os, 'read', side_effect=read), patch.object(guest.os, 'open', wraps=os.open) as opened:
+            with self.assertRaisesRegex(RuntimeError, 'changed in place'):
+                guest.read_private(self.path, 4096)
+        self.assertEqual(opened.call_count, 1)
+
+    def test_replacement_retries_are_bounded(self):
+        real = os.fstat
+        def fstat(fd):
+            self.replace()
+            return real(fd)
+        with patch.object(guest.os, 'fstat', side_effect=fstat), patch.object(guest.os, 'read', wraps=os.read) as read:
+            with self.assertRaisesRegex(RuntimeError, 'three bounded'):
+                guest.read_private(self.path, 4096)
+        self.assertEqual(self.replacements, 3)
+        read.assert_not_called()
+
+    def test_permissions_owner_hardlinks_and_oversize_still_fail_closed(self):
+        self.path.chmod(0o644)
+        with self.assertRaisesRegex(RuntimeError, 'Unsafe collector_runtime metadata'):
+            guest.read_private(self.path, 4096)
+        self.path.chmod(0o600)
+        with patch.object(guest, 'ROOT_UID', os.geteuid() + 1), self.assertRaisesRegex(RuntimeError, 'Unsafe collector_runtime metadata'):
+            guest.read_private(self.path, 4096)
+        alias = self.directory / 'alias'
+        os.link(self.path, alias)
+        with self.assertRaisesRegex(RuntimeError, 'Unsafe collector_runtime metadata'):
+            guest.read_private(self.path, 4096)
+        alias.unlink()
+        self.path.write_bytes(b'x' * 4097)
+        with self.assertRaisesRegex(RuntimeError, 'Unsafe collector_runtime metadata'):
+            guest.read_private(self.path, 4096)
+
+    def test_symlinks_and_other_paths_never_use_replacement_retry(self):
+        target = self.directory / 'target'
+        self.path.rename(target); self.path.symlink_to(target)
+        with self.assertRaisesRegex(RuntimeError, 'could not be opened safely'):
+            guest.read_private(self.path, 4096)
+        with self.assertRaisesRegex(RuntimeError, 'Only collector_runtime'):
+            guest.read_runtime_snapshot(target)
 
 
 class ReplayAcrossRestartTests(unittest.TestCase):
