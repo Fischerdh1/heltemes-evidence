@@ -139,6 +139,7 @@ class ArchiveJournal:
         self.connection, self.lock_fd = None, None
         self.failure = None
         self.recovery_actions = []
+        self._duplicate_segment_cache = None
         try:
             store.ordinary(self.path / "service.lock", limit=0)
             self.lock_fd = os.open(self.path / "service.lock", os.O_RDWR | os.O_NOFOLLOW)
@@ -302,10 +303,29 @@ class ArchiveJournal:
         if location is None:
             return None
         segment, sequence = location
-        rows = self.rows if segment is None else self._read_segment(self.segments[segment - 1])
+        if segment is None:
+            rows = self.rows
+        else:
+            descriptor = self.segments[segment - 1]
+            key = (self.identity["database_id"], tuple(descriptor))
+            cached = self._duplicate_segment_cache
+            if cached is not None and cached[0] == key:
+                # A lost acknowledgement can otherwise repeatedly decode and
+                # canonicalize a whole archive before the same bounded reply.
+                # Reuse only the private parsed copy; every hit still verifies
+                # the current protected file's exact bytes and descriptor.
+                raw = store.read_private(self.archive_path / self._filename(descriptor[0]))
+                store.require(len(raw) == descriptor[4] and hashlib.sha256(raw).hexdigest() == descriptor[5],
+                              "Archive segment bytes differ.")
+                rows = cached[1]
+            else:
+                rows = self._read_segment(descriptor)
+                # This fresh parse is owned only by the duplicate cache.
+                # Startup replay, rotation, and exports never share its rows.
+                self._duplicate_segment_cache = (key, rows)
         row = next((item for item in rows if item["sequence"] == sequence), None)
         store.require(row is not None and row["request_id"] == request_id, "Duplicate request location differs.")
-        return row
+        return copy.deepcopy(row)
 
     def _rotation_payload(self, rows):
         store.require(len(self.segments) < MAX_SEGMENTS, "Archive segment budget exhausted.")

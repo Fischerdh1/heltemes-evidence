@@ -5,9 +5,9 @@ import threading
 import unittest
 from http.client import HTTPConnection
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
-from heltemes.server import DashboardServer
+from heltemes.server import DashboardServer, Handler
 
 
 class ServerTests(unittest.TestCase):
@@ -25,7 +25,7 @@ class ServerTests(unittest.TestCase):
         cls.thread.join()
         cls.temp.cleanup()
 
-    def req(self, path, body=None, headers=None):
+    def req(self, path, body=None, headers=None, *, wait_for_idle=True):
         conn = HTTPConnection('127.0.0.1', self.server.server_port, timeout=5)
         h = headers or {}
         if body is not None:
@@ -34,6 +34,12 @@ class ServerTests(unittest.TestCase):
         r = conn.getresponse()
         result = r.status, dict(r.getheaders()), r.read()
         conn.close()
+        if wait_for_idle:
+            # A complete response can arrive before do_POST's finally releases
+            # its operation lock. Sequential tests wait for that boundary.
+            acquired = self.server.operation_lock.acquire(timeout=5)
+            self.assertTrue(acquired, 'The previous dashboard operation did not finish.')
+            self.server.operation_lock.release()
         return result
 
     def test_local_health_and_response_headers(self):
@@ -93,7 +99,53 @@ class ServerTests(unittest.TestCase):
 
     def test_busy_operation_rejected(self):
         with self.server.operation_lock:
-            self.assertEqual(self.req('/api/verify', {})[0], 409)
+            self.assertEqual(self.req('/api/verify', {}, wait_for_idle=False)[0], 409)
+
+    def test_sequential_requests_wait_for_handler_lock_release_after_response(self):
+        written, waiting, release, finished = (threading.Event() for _ in range(4))
+        results, errors = [], []
+        original_send, original_lock = Handler.send_data, self.server.operation_lock
+        observed_lock = Mock(wraps=original_lock)
+
+        def acquire(*args, **kwargs):
+            if kwargs.get('timeout') == 5:
+                waiting.set()
+            return original_lock.acquire(*args, **kwargs)
+
+        def delayed_send(handler, status, body, *args, **kwargs):
+            original_send(handler, status, body, *args, **kwargs)
+            if status == 409 and isinstance(body, dict) and body.get('error', '').startswith('Live collection needs'):
+                written.set()
+                if not release.wait(5):
+                    errors.append('Handler release deadline exceeded.')
+
+        def collect():
+            try:
+                results.append(self.req('/api/collect', {'cik': '320193', 'forms': ['10-Q'], 'limit': 1}))
+            except BaseException as error:
+                errors.append(error)
+            finally:
+                finished.set()
+
+        observed_lock.acquire.side_effect = acquire
+        thread = threading.Thread(target=collect, daemon=True)
+        with patch.dict('os.environ', {}, clear=True), patch.object(Handler, 'send_data', delayed_send), \
+             patch.object(self.server, 'operation_lock', observed_lock):
+            try:
+                thread.start()
+                self.assertTrue(written.wait(2), 'The handler did not send its response.')
+                self.assertTrue(waiting.wait(2), 'The request helper did not reach the completion boundary.')
+                self.assertTrue(original_lock.locked())
+                self.assertFalse(finished.is_set(), 'Reading the response incorrectly finished the sequential request.')
+                release.set()
+                self.assertTrue(finished.wait(2), 'The request did not finish after the handler was released.')
+                self.assertEqual(errors, [])
+                self.assertEqual(results[0][0], 409)
+                self.assertEqual(self.req('/api/collect', {'cik': 'https://evil.test'})[0], 400)
+            finally:
+                release.set()
+                thread.join(timeout=5)
+        self.assertFalse(thread.is_alive(), 'The bounded test client did not finish.')
 
     def test_non_loopback_binding_refused(self):
         with self.assertRaises(ValueError):

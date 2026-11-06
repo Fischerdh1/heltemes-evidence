@@ -300,7 +300,9 @@ def crash_rollover(point, number, started, incident):
             except (ValueError, OSError):
                 pass
         time.sleep(0.1)
-    require(marker is not None, 'Archive handoff boundary was not reached: ' + json.dumps(diagnostics(), sort_keys=True))
+    if marker is None:
+        raise RuntimeError('Archive handoff boundary was not reached: ' + json.dumps({
+            'services': diagnostics(), 'collector_state': collector_diagnostic('')}, sort_keys=True))
     managed = manager(MONITOR_UNIT)
     require(marker['point'] == point and marker['head_sequence'] == SEGMENT_ROWS * number
             and managed['MainPID'] == marker['process_id'] == before['status']['process_id']
