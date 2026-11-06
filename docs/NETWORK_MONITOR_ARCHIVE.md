@@ -65,7 +65,7 @@ The exporter holds the same writer lock, verifies the complete history, and neve
 | Three `.pcap` and three packet-text files | Actual synthetic connection attempts and capture results |
 | `SUMMARY.md`, `MANIFEST.json` | Readable result and fingerprints of all other public files |
 
-A successful run is evidence for bounded automatic archiving and process-crash recovery. It does not establish indefinite production monitoring, automatic expiration, off-device backup, administrator-resistant custody, or physical power-loss durability during archiving. The earlier reboot and power-cut jobs remain separate regression checks; this exercise stays within one guest boot.
+A successful run is evidence for bounded automatic archiving and process-crash recovery. It does not establish indefinite production monitoring, automatic expiration, off-device backup, administrator-resistant custody, or physical power-loss durability during archiving. The earlier reboot and power-cut jobs remain separate regression checks; this exercise stays within one guest boot. The separate [archived-history reboot exercise](NETWORK_MONITOR_ARCHIVE_REBOOT.md) tests this archive format across a full guest reboot and continues into a third segment.
 
 ## Interview explanation
 
