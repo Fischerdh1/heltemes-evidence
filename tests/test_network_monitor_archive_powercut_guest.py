@@ -30,7 +30,9 @@ class ArchivePowerCutGuestTests(unittest.TestCase):
         self.runtime.mkdir(mode=0o700); self.fixture = Fixture(); self.fixture.time = datetime.now(timezone.utc); self.journal = None
         self.stack = ExitStack(); self.addCleanup(self.stack.close); self.addCleanup(self.close)
         for name, value in {'STATE': self.state, 'RUNTIME': self.runtime, 'ARM': self.runtime / 'arm.json',
-                            'BOUNDARY': self.runtime / 'boundary.json', 'VOLATILE': self.runtime / 'volatile'}.items():
+                            'BOUNDARY': self.runtime / 'boundary.json', 'VOLATILE': self.runtime / 'volatile',
+                            'BOUNDARY_WRITING': self.runtime / 'boundary.json.writing', 'PROGRESS': self.runtime / 'boundary-progress.json',
+                            'PROGRESS_WRITING': self.runtime / 'boundary-progress.json.writing'}.items():
             self.stack.enter_context(patch.object(guest, name, value))
         self.stack.enter_context(patch.object(guest.reboot, 'ordinary', side_effect=lambda p, **kw: store.ordinary(p)))
         self.stack.enter_context(patch.object(guest, 'command', return_value=Mock(stdout='tmpfs\n')))
@@ -70,7 +72,7 @@ class ArchivePowerCutGuestTests(unittest.TestCase):
         return previous, payload, marker
 
     def clear_volatile(self):
-        for path in (guest.ARM, guest.BOUNDARY, guest.VOLATILE):
+        for path in (guest.ARM, guest.BOUNDARY, guest.VOLATILE, guest.BOUNDARY_WRITING, guest.PROGRESS, guest.PROGRESS_WRITING):
             if path.exists():
                 path.unlink()
 
@@ -152,7 +154,11 @@ class ArchivePowerCutGuestTests(unittest.TestCase):
         with patch.object(store, 'write_new', side_effect=write), patch.object(store, 'sync_directory', wraps=store.sync_directory) as sync:
             with self.assertRaises(SimulatedCut):
                 self.worker.dispatch(payload)
-        self.assertEqual(destinations, [self.state / 'archives' / 'segment-000001.json.pending', guest.BOUNDARY])
+        self.assertEqual(destinations, [self.state / 'archives' / 'segment-000001.json.pending',
+            guest.PROGRESS_WRITING, guest.PROGRESS_WRITING, guest.PROGRESS_WRITING,
+            guest.BOUNDARY_WRITING, guest.PROGRESS_WRITING])
+        self.assertFalse(guest.BOUNDARY_WRITING.exists())
+        self.assertEqual(store.parse(guest.PROGRESS.read_bytes())['phase'], 'marker_published')
         sync.assert_not_called()
 
     def test_boundary_refuses_nonvolatile_marker_filesystem(self):
@@ -162,6 +168,58 @@ class ArchivePowerCutGuestTests(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, 'tmpfs'):
                 self.worker.dispatch(payload)
         self.assertFalse(guest.BOUNDARY.exists())
+
+    def test_hook_captures_exact_bytes_without_repeating_semantic_replay(self):
+        self.fill(127)
+        with (patch.object(guest, 'history_from_connection', side_effect=AssertionError('full projection inside hook')),
+              patch.object(guest.archive, 'StreamingMonitor', side_effect=AssertionError('replay inside hook'))):
+            _, _, marker = self.reach_cut('staging')
+        self.assertEqual(marker['head_sequence'], 128)
+        self.assertEqual(marker['head_digest'], marker['rows'][-1]['row_digest'])
+
+    def test_atomic_marker_publication_hides_partial_content(self):
+        raw = b'{"complete":true}\n'; original = store.write_new
+        def write(path, data):
+            self.assertEqual(path, guest.BOUNDARY_WRITING)
+            self.assertFalse(guest.BOUNDARY.exists())
+            original(path, data)
+            self.assertFalse(guest.BOUNDARY.exists())
+        with patch.object(store, 'write_new', side_effect=write), patch.object(store, 'sync_directory') as sync:
+            guest.publish_boundary(raw)
+        self.assertEqual(guest.BOUNDARY.read_bytes(), raw); self.assertFalse(guest.BOUNDARY_WRITING.exists())
+        sync.assert_not_called()
+
+    def test_failed_marker_publication_never_exposes_a_partial_boundary(self):
+        with patch.object(guest.os, 'rename', side_effect=OSError('test failure')):
+            with self.assertRaises(OSError):
+                guest.publish_boundary(b'{"complete":true}\n')
+        self.assertFalse(guest.BOUNDARY.exists()); self.assertTrue(guest.BOUNDARY_WRITING.exists())
+        with self.assertRaisesRegex(RuntimeError, 'Stale boundary'):
+            guest.publish_boundary(b'{}')
+
+    def test_timeout_keeps_original_bound_and_reports_only_bounded_control_state(self):
+        progress = {'point': 'archive_metadata_committed', 'phase': 'snapshot_captured', 'process_id': 123,
+                    'expected_head': 384, 'elapsed_ms': 44000, 'marker_bytes': 0}
+        store.write_new(guest.PROGRESS, store.encoded(progress).encode())
+        output = 'ActiveState=failed\nSubState=failed\nMainPID=0\nNRestarts=1\nResult=exit-code\nExecMainCode=1\nExecMainStatus=74\nPRIVATE=do-not-publish\n'
+        with (patch.object(guest.time, 'monotonic', side_effect=[0.0, 44.999, 45.0]),
+              patch.object(guest.time, 'sleep') as sleep,
+              patch.object(guest, 'command', return_value=Mock(stdout=output))):
+            with self.assertRaisesRegex(RuntimeError, 'Exact stopped archive boundary') as caught:
+                guest.wait_for_boundary('arm-metadata', 'metadata', {}, {}, {'MainPID': 123})
+        sleep.assert_called_once_with(0.05)
+        diagnostic = json.loads(str(caught.exception).split(': ', 1)[1])
+        self.assertEqual(diagnostic['progress'], progress)
+        self.assertEqual(diagnostic['manager']['ExecMainStatus'], 74)
+        self.assertEqual(diagnostic['files']['marker'], {'exists': False})
+        self.assertLess(len(str(caught.exception)), 1500)
+        self.assertNotIn('do-not-publish', str(caught.exception)); self.assertNotIn(str(self.base), str(caught.exception))
+
+    def test_untrusted_progress_content_is_omitted_from_failure_diagnostic(self):
+        store.write_new(guest.PROGRESS, b'{"phase":"secret-payload"}')
+        diagnostic = guest.boundary_diagnostic(123)
+        self.assertEqual(diagnostic['files']['progress'], {'inspection_error': 'RuntimeError'})
+        self.assertNotIn('secret-payload', json.dumps(diagnostic))
 
     def test_boundary_refuses_a_different_request_than_the_armed_one(self):
         self.fill(127); payload = guest.boundary_payload('staging')

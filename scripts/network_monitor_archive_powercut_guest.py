@@ -34,6 +34,10 @@ STATE, REPORT = DATA / 'state', DATA / 'report'
 PUBLISH = REPORT / 'publish'
 RUNTIME = Path('/run/heltemes-archive-powercut-lab')
 ARM, BOUNDARY, VOLATILE = (RUNTIME / n for n in ('arm.json', 'boundary.json', 'precut-marker'))
+BOUNDARY_WRITING = RUNTIME / 'boundary.json.writing'
+PROGRESS = RUNTIME / 'boundary-progress.json'
+PROGRESS_WRITING = RUNTIME / 'boundary-progress.json.writing'
+PROGRESS_PHASES = ('hook_entered', 'snapshot_captured', 'marker_encoded', 'marker_published')
 UNIT = 'heltemes-archive-powercut-monitor.service'
 UNIT_FILE = Path('/etc/systemd/system') / UNIT
 SOURCE_FILES = (*reboot.SOURCE_FILES, 'scripts/network_monitor_archive.py',
@@ -54,7 +58,8 @@ DESCRIPTOR_KEYS = ('segment_index', 'first_sequence', 'last_sequence', 'row_coun
 
 def guard(token):
     virtualization = reboot.guard(token)
-    for path in (DATA, STATE, REPORT, PUBLISH, RUNTIME, ARM, BOUNDARY, VOLATILE, UNIT_FILE):
+    for path in (DATA, STATE, REPORT, PUBLISH, RUNTIME, ARM, BOUNDARY, VOLATILE, BOUNDARY_WRITING,
+                 PROGRESS, PROGRESS_WRITING, UNIT_FILE):
         require(not any(p.is_symlink() for p in (path, *path.parents)), 'Archive power-cut paths cannot traverse links.')
     return virtualization
 
@@ -144,29 +149,55 @@ def read_public(name):
     return store.parse(path.read_bytes())
 
 
-def history_from_connection(connection):
-    """Read an already committed snapshot without a writer lock or disk flush."""
-    config = connection.execute('SELECT identity,approved,head_sequence,head_digest FROM config WHERE id=1').fetchone()
+def committed_snapshot_from_connection(connection):
+    """Capture exact committed bytes; the host replays boundary snapshots before cutting power.
+
+This reads and checks protected files, canonical encoding, SQL descriptors, and
+the complete row chain. It deliberately does not repeat the monitor's semantic
+evaluation inside the short pause callback. Ordinary snapshots use the full
+replay wrapper below, and cold starts retain ArchiveJournal's normal validation.
+"""
+    config = connection.execute('SELECT identity,approved,head_sequence,head_digest,archived_sequence,archived_digest FROM config WHERE id=1').fetchone()
     require(config is not None, 'Missing archive configuration.')
     identity, approved = store.parse(config[0]), store.parse(config[1])
     descriptors = connection.execute('SELECT * FROM segments ORDER BY segment_index').fetchall()
     rows = []
-    for descriptor in descriptors:
+    for index, descriptor in enumerate(descriptors, 1):
         raw = store.read_private(STATE / 'archives' / f'segment-{descriptor[0]:06d}.json')
         require(len(raw) == descriptor[4] and hashlib.sha256(raw).hexdigest() == descriptor[5], 'Committed archive bytes differ.')
         segment = store.parse(raw)
         require(raw == (store.encoded(segment) + '\n').encode() and segment['database_id'] == identity['database_id'],
                 'Archive encoding or identity differs.')
+        segment_rows = segment['rows']
+        require(descriptor == (index, len(rows) + 1, len(rows) + len(segment_rows), len(segment_rows), len(raw),
+                hashlib.sha256(raw).hexdigest(), segment_rows[-1]['row_digest']) and len(segment_rows) == SEGMENT_ROWS
+                and segment['segment_index'] == index and segment['first_sequence'] == descriptor[1]
+                and segment['last_sequence'] == descriptor[2] and segment['last_digest'] == descriptor[6]
+                and segment['previous_digest'] == (rows[-1]['row_digest'] if rows else store.ZERO),
+                'Committed archive descriptor or prefix differs.')
         rows.extend(segment['rows'])
+    require(config[4] == len(rows) and config[5] == (rows[-1]['row_digest'] if rows else store.ZERO),
+            'Committed archive SQL head differs.')
     rows.extend(powercut.sql_rows(connection))
     require(len(rows) == config[2] <= MAX_ROWS and rows[-1]['row_digest'] == config[3], 'Snapshot head differs.')
-    engine = archive.StreamingMonitor(approved); previous, seen = store.ZERO, set()
+    previous, seen = store.ZERO, set()
     for sequence, row in enumerate(rows, 1):
         require(row['sequence'] == row['sample']['sequence'] == sequence and row['previous_digest'] == previous
                 and row['request_id'] not in seen and store.digest({k: v for k, v in row.items() if k != 'row_digest'}) == row['row_digest'],
                 'Snapshot sequence or digest chain differs.')
-        require(engine.observe(row['sample']) == row['evaluation'] and engine.events == row['events'], 'Snapshot deterministic replay differs.')
         previous = row['row_digest']; seen.add(row['request_id'])
+    return {'identity': identity, 'approved_policy': approved, 'rows': rows,
+            'archive_descriptors': [dict(zip(DESCRIPTOR_KEYS, item)) for item in descriptors]}
+
+
+def history_from_connection(connection):
+    """Fully replay an already committed snapshot without writing or flushing disk."""
+    captured = committed_snapshot_from_connection(connection)
+    identity, approved, rows = captured['identity'], captured['approved_policy'], captured['rows']
+    engine = archive.StreamingMonitor(approved)
+    for row in rows:
+        require(engine.observe(row['sample']) == row['evaluation'] and engine.events == row['events'], 'Snapshot deterministic replay differs.')
+    descriptors = [tuple(item[key] for key in DESCRIPTOR_KEYS) for item in captured['archive_descriptors']]
     # The exporter only consumes these immutable snapshot values; no journal is opened for writing.
     view = SimpleNamespace(identity=identity, approved=approved, segments=descriptors, iter_rows=lambda: iter(rows))
     return archive.ArchiveJournal.export(view)
@@ -270,6 +301,78 @@ def boundary_payload(key):
             'observed_at_utc': reboot.timestamp(), 'ruleset': None, 'collection_error': 'archive_powercut_test_boundary', 'probes': []}}
 
 
+def progress_record(key, phase, started, *, marker_bytes=0):
+    """Publish only bounded control-plane progress on the already verified tmpfs."""
+    require(key in POINTS and phase in PROGRESS_PHASES and type(marker_bytes) is int
+            and 0 <= marker_bytes <= store.MAX_BYTES, 'Invalid boundary progress.')
+    value = {'point': POINTS[key], 'phase': phase, 'process_id': os.getpid(), 'expected_head': HEADS[key],
+             'elapsed_ms': max(0, int((time.monotonic() - started) * 1000)), 'marker_bytes': marker_bytes}
+    require(not PROGRESS_WRITING.exists() and not PROGRESS_WRITING.is_symlink(), 'Stale progress staging file.')
+    if PROGRESS.exists() or PROGRESS.is_symlink():
+        store.ordinary(PROGRESS, limit=1024)
+    store.write_new(PROGRESS_WRITING, (store.encoded(value) + '\n').encode())
+    os.replace(PROGRESS_WRITING, PROGRESS)
+
+
+def publish_boundary(raw):
+    require(isinstance(raw, bytes) and len(raw) <= store.MAX_BYTES, 'Boundary marker exceeds its bound.')
+    require(not any(p.exists() or p.is_symlink() for p in (BOUNDARY, BOUNDARY_WRITING)), 'Stale boundary publication exists.')
+    store.write_new(BOUNDARY_WRITING, raw)
+    # Atomic tmpfs publication prevents the reader repeatedly parsing a partially
+    # written multi-megabyte marker while the single writer is still finishing it.
+    os.rename(BOUNDARY_WRITING, BOUNDARY)
+
+
+def boundary_diagnostic(pid):
+    """Retain bounded state on failure without logs, observations, or private paths."""
+    result = {'expected_process_id': pid if type(pid) is int and pid > 0 else None,
+              'process_state': 'unavailable', 'files': {}}
+    for label, path in (('progress', PROGRESS), ('marker', BOUNDARY), ('marker_writing', BOUNDARY_WRITING)):
+        try:
+            info = path.lstat()
+            result['files'][label] = {'exists': True, 'bytes': info.st_size, 'regular': stat.S_ISREG(info.st_mode),
+                                      'mode': stat.S_IMODE(info.st_mode), 'links': info.st_nlink}
+            if label == 'progress':
+                value = store.parse(store.read_private(path, limit=1024))
+                require(set(value) == {'point', 'phase', 'process_id', 'expected_head', 'elapsed_ms', 'marker_bytes'}
+                        and value['point'] in POINTS.values() and value['phase'] in PROGRESS_PHASES
+                        and all(type(value[k]) is int and 0 <= value[k] <= 2 ** 63 - 1
+                                for k in ('process_id', 'expected_head', 'elapsed_ms', 'marker_bytes')),
+                        'Invalid bounded progress diagnostic.')
+                result['progress'] = value
+        except FileNotFoundError:
+            result['files'][label] = {'exists': False}
+        except (OSError, ValueError, RuntimeError, TypeError, KeyError) as error:
+            result['files'][label] = {'inspection_error': type(error).__name__}
+    try:
+        if type(pid) is int and pid > 0:
+            raw = (Path('/proc') / str(pid) / 'status').read_text()
+            require(len(raw) <= 65536, 'Process status exceeds diagnostic bound.')
+            state = next(line.split()[1] for line in raw.splitlines() if line.startswith('State:'))
+            require(state in {'R', 'S', 'D', 'T', 't', 'Z', 'X', 'I'}, 'Unknown process state.')
+            result['process_state'] = state
+    except (OSError, ValueError, RuntimeError, StopIteration):
+        pass
+    try:
+        fields = ('ActiveState', 'SubState', 'MainPID', 'NRestarts', 'Result', 'ExecMainCode', 'ExecMainStatus')
+        response = command(['systemctl', 'show', '--no-pager', '--property=' + ','.join(fields), UNIT], timeout=3, check=False)
+        values = dict(line.split('=', 1) for line in response.stdout.splitlines() if '=' in line)
+        managed = {}
+        for key in ('MainPID', 'NRestarts', 'ExecMainCode', 'ExecMainStatus'):
+            value = values.get(key, '')
+            if len(value) <= 16 and value.lstrip('-').isdecimal():
+                managed[key] = int(value)
+        allowed = {'ActiveState': {'active', 'inactive', 'failed', 'activating', 'deactivating', 'reloading'},
+                   'SubState': {'running', 'dead', 'failed', 'start', 'start-pre', 'start-post', 'auto-restart', 'stop-sigterm', 'stop-sigkill'},
+                   'Result': {'success', 'exit-code', 'signal', 'core-dump', 'timeout', 'watchdog', 'start-limit-hit', 'resources', 'oom-kill'}}
+        for key, choices in allowed.items():
+            managed[key] = values[key] if values.get(key) in choices else 'unavailable'
+        result['manager'] = managed
+    except (OSError, ValueError, RuntimeError, subprocess.SubprocessError):
+        result['manager'] = {'inspection_error': 'unavailable'}
+    return result
+
+
 class ExerciseJournal(archive.ArchiveJournal):
     def append(self, request_id, observation, elapsed_seconds, *, restart=False, fault=None):
         def boundary(point):
@@ -285,8 +388,11 @@ class ExerciseJournal(archive.ArchiveJournal):
             require(request_id == REQUEST_IDS[key] and armed['request']['request_id'] == request_id
                     and armed['request']['observation'] == observation, 'Archive arm request differs.')
             require(command(['findmnt', '-n', '-o', 'FSTYPE', '--target', str(RUNTIME)]).stdout.strip() == 'tmpfs', 'Boundary storage must be tmpfs.')
-            require(not BOUNDARY.exists() and not BOUNDARY.is_symlink() and not self.connection.in_transaction, 'Invalid boundary state.')
-            history = history_from_connection(self.connection)
+            require(not any(p.exists() or p.is_symlink() for p in (BOUNDARY, BOUNDARY_WRITING, PROGRESS, PROGRESS_WRITING))
+                    and not self.connection.in_transaction, 'Invalid boundary state.')
+            started = time.monotonic(); progress_record(key, 'hook_entered', started)
+            history = committed_snapshot_from_connection(self.connection)
+            progress_record(key, 'snapshot_captured', started)
             require(len(history['rows']) == HEADS[key], 'Archive hook head differs.')
             final = STATE / 'archives' / f'segment-{HEADS[key] // SEGMENT_ROWS:06d}.json'
             pending = final.with_name(final.name + '.pending')
@@ -304,7 +410,10 @@ class ExerciseJournal(archive.ArchiveJournal):
                 'synchronous': self.connection.execute('PRAGMA synchronous').fetchone()[0],
                 'journal_mode': self.connection.execute('PRAGMA journal_mode').fetchone()[0], 'observed_at_utc': reboot.timestamp()}
             # Only tmpfs is written here: no persistent-disk flush is added after arming.
-            store.write_new(BOUNDARY, (store.encoded(marker) + '\n').encode())
+            raw = (store.encoded(marker) + '\n').encode()
+            progress_record(key, 'marker_encoded', started, marker_bytes=len(raw))
+            publish_boundary(raw)
+            progress_record(key, 'marker_published', started, marker_bytes=len(raw))
             os.kill(os.getpid(), signal.SIGSTOP)
             os._exit(74)
         return super().append(request_id, observation, elapsed_seconds, restart=restart, fault=boundary)
@@ -336,7 +445,8 @@ def arm(name, token):
     status, properties = ready()
     require(status['committed_count'] == HEADS[key] - 1 and status['head_digest'] == previous['final_status']['head_digest']
             and status['instance_id'] == previous['final_status']['instance_id'], 'Archive head changed before arming.')
-    require(not any(p.exists() or p.is_symlink() for p in (ARM, BOUNDARY, VOLATILE)), 'Stale volatile boundary exists.')
+    require(not any(p.exists() or p.is_symlink() for p in (ARM, BOUNDARY, VOLATILE, BOUNDARY_WRITING,
+                                                        PROGRESS, PROGRESS_WRITING)), 'Stale volatile boundary exists.')
     require(command(['findmnt', '-n', '-o', 'FSTYPE', '--target', str(RUNTIME)]).stdout.strip() == 'tmpfs', 'Arm storage must be tmpfs.')
     payload = boundary_payload(key)
     store.write_new(ARM, (store.encoded({'key': key, 'request': payload, 'instance_id': status['instance_id']}) + '\n').encode())
@@ -345,18 +455,19 @@ def arm(name, token):
     require(stat.S_ISSOCK(info.st_mode) and info.st_uid == 0 and stat.S_IMODE(info.st_mode) == 0o600, 'Unsafe monitor socket.')
     with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as connection:
         connection.settimeout(3); connection.connect(str(path)); connection.sendall((store.encoded(payload) + '\n').encode())
-        deadline = time.monotonic() + 45
-        while time.monotonic() < deadline:
-            if BOUNDARY.exists():
-                try:
-                    marker = store.parse(store.read_private(BOUNDARY))
-                except (ValueError, UnicodeError):
-                    time.sleep(0.05); continue
-                if powercut.process_stopped(marker['process_id']):
-                    validate_boundary(marker, key, previous, history)
-                    return boundary_response(name, marker, properties)
-            time.sleep(0.05)
-    raise RuntimeError('Exact stopped archive boundary was not observed.')
+        return wait_for_boundary(name, key, previous, history, properties)
+
+
+def wait_for_boundary(name, key, previous, history, properties):
+    deadline = time.monotonic() + 45
+    while time.monotonic() < deadline:
+        if BOUNDARY.exists():
+            marker = store.parse(store.read_private(BOUNDARY))
+            if powercut.process_stopped(marker['process_id']):
+                validate_boundary(marker, key, previous, history)
+                return boundary_response(name, marker, properties)
+        time.sleep(0.05)
+    raise RuntimeError('Exact stopped archive boundary was not observed: ' + store.encoded(boundary_diagnostic(properties['MainPID'])))
 
 
 def boundary_response(name, marker, properties):
@@ -379,7 +490,8 @@ def inspect_boundary(name, token):
 
 def verify_start(previous, old, boot, status, properties, history, storage, hashes, key):
     require(boot['boot_id'] != previous['boot']['boot_id'] and hashes == previous['source_sha256'], 'Boot or source identity differs.')
-    require(not any(p.exists() or p.is_symlink() for p in (ARM, BOUNDARY, VOLATILE)), 'Old volatile boundary survived.')
+    require(not any(p.exists() or p.is_symlink() for p in (ARM, BOUNDARY, VOLATILE, BOUNDARY_WRITING,
+                                                        PROGRESS, PROGRESS_WRITING)), 'Old volatile boundary survived.')
     require(all(storage[k] == previous['storage'][k] for k in ('target', 'source', 'fstype', 'uuid')), 'Persistent filesystem changed.')
     require(properties['InvocationID'] != previous['manager']['InvocationID']
             and status['instance_id'] != previous['final_status']['instance_id'], 'Monitor did not start a new boot instance.')

@@ -25,6 +25,8 @@ All three cuts occur **after the observation commits**. Each boundary request is
 
 The monitor starts automatically after boot. The harness supplies bounded observations and explicitly rebuilds the network. This exercise does not enable the continuous collector or its missing-data timer; those are exercised separately. Its final 520 rows include four startup boundaries, three labeled power-cut test records, and 513 submitted network observations. Four 128-row archive files hold 512 rows, leaving eight active rows.
 
+A submitted observation is not automatically valid coverage. If reconstruction takes longer than the existing 30-second sampling limit, the first postboot rules snapshot records unknown coverage with an explicit interval diagnostic. The next suitable observation establishes a fresh baseline; fresh connection checks are still required before the original incident resolves. The test does not extend that sampling limit to obtain a healthy result.
+
 ## Reproduce and inspect
 
 Use a clean committed checkout on a disposable x86-64 Linux host with QEMU, cloud-image-utils, OpenSSH client tools, curl, Git, and Python 3.11 or newer:
