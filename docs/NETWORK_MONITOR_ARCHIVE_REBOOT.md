@@ -45,6 +45,8 @@ The controller refuses macOS before creating an output directory. The output mus
 
 All archives remain bounded by row, byte, segment, and probe budgets. This test does not establish indefinite production operation, archive handoff durability under sudden power loss, off-device backup, administrator-resistant custody, separate-account isolation, or external alert delivery. A graceful reboot and an abrupt virtual power cut are different tests.
 
+The separate [archive power-loss exercise](NETWORK_MONITOR_ARCHIVE_POWERCUT.md) targets three archive handoff boundaries with abrupt whole-VM termination and cold starts.
+
 ## Interview explanation
 
 “I tested an archived monitoring journal through a full Linux VM reboot. I held the original archive bytes outside the guest, verified that the same disk reopened under a new kernel boot, and checked that automatic startup preserved the unresolved incident while reporting unknown coverage. Fresh network checks were required before recovery. Collection then continued into a third archive segment with the original global history and port allocation intact. The test uses a disposable synthetic network and explicit network reconstruction.”
