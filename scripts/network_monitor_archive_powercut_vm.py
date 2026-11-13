@@ -132,14 +132,17 @@ class DisposableVM(reboot.DisposableVM):
         settled_cache = cache_evidence(self.qmp.command("query-block"))
         if not self.installed:
             progress("installing only the allowlisted synthetic lab source")
-            self.ssh("sudo -n mkdir -p " + GUEST_ROOT + " && sudo -n tar -xz --no-same-owner -f - -C " + GUEST_ROOT,
-                     input=source_archive(), timeout=60)
+            self.install_source()
             self.installed = True
         self.boots.append({"boot_number": len(self.boots) + 1, "snapshot": snapshot,
                            "launch_started_elapsed_seconds": self.last_launch_started,
                            "disk_cache": disk_cache, "disk_cache_after_boot": settled_cache, "qmp_kvm": self.kvm_status,
                            "cloud_init": cloud_init, "source_uploaded": previous is None})
         return snapshot
+
+    def install_source(self):
+        self.ssh("sudo -n mkdir -p " + GUEST_ROOT + " && sudo -n tar -xz --no-same-owner -f - -C " + GUEST_ROOT,
+                 input=source_archive(), timeout=60)
 
     def guest(self, stage):
         require(stage in {*STAGES, *("arm-" + label for label in LABELS), *("inspect-" + label for label in LABELS), "cleanup"},
@@ -169,6 +172,14 @@ class DisposableVM(reboot.DisposableVM):
         require(canonical(recheck["boundary"]) == canonical(boundary["boundary"])
                 and recheck["manager"]["InvocationID"] == boundary["manager"]["InvocationID"],
                 "The live stopped transaction boundary differs from its host-held reference.")
+        evidence = self.cut_and_relaunch(before, point)
+        evidence.update(point=point, boundary=boundary, boundary_recheck=recheck)
+        validate_power_cut(evidence)
+        return evidence
+
+
+    def cut_and_relaunch(self, before, label):
+        """Kill the owned QEMU process and cold-start the retained guest disk."""
         self.require_running()
         disk_cache = cache_evidence(self.qmp.command("query-block"))
         requested = time.monotonic() - self.started
@@ -184,18 +195,15 @@ class DisposableVM(reboot.DisposableVM):
         outage = self.ssh("true", timeout=8, check=False)
         require(outage.returncode != 0, "SSH unexpectedly remained available after the owned VM was killed.")
         require((self.directory / "disk.qcow2").exists(), "The persistent VM disk disappeared after the power cut.")
-        progress(point + ": whole VM killed; cold-starting its retained disk")
+        progress(label + ": whole VM killed; cold-starting its retained disk")
         after = self.launch(previous=before)
-        evidence = {"point": point, "boundary": boundary, "boundary_recheck": recheck, "before": before, "after": after,
+        return {"before": before, "after": after,
                     "disk_cache_before_cut": disk_cache,
                     "signal": "SIGKILL", "qemu_wait_returncode": result, "old_qemu_reaped": True,
                     "power_cut_elapsed_seconds": requested, "qemu_terminated_elapsed_seconds": terminated,
                     "cold_launch_elapsed_seconds": self.last_launch_started,
                     "ssh_unavailable_observed": True, "new_qemu_process": True, "same_disk": True,
                     "guest_shutdown_requested": False, "qemu_graceful_exit_requested": False}
-        validate_power_cut(evidence)
-        return evidence
-
 
 def replay_rows(rows, approved):
     require(isinstance(rows, list) and 0 < len(rows) <= 2048, "History row count is outside its bound.")
