@@ -1,4 +1,4 @@
-"""A failed or skipped VM exercise must never produce reviewer acceptance."""
+"""Failed or skipped prerequisites must block reviewer packaging."""
 import json
 import os
 from pathlib import Path
@@ -17,7 +17,7 @@ class MonitorCIGateTests(unittest.TestCase):
         names = (
             'python', 'terraform', 'network_lab', 'monitor_reboot', 'monitor_powercut', 'monitor_automatic',
             'monitor_archive', 'monitor_archive_reboot', 'monitor_archive_powercut', 'monitor_archive_retry',
-            'clean_restore',
+            'clean_restore', 'key_rotation_restore',
         )
         self.assertIn('    if: ${{ always() }}\n', reviewer)
         self.assertIn(f"    needs: [{', '.join(names)}]\n", reviewer)
@@ -68,6 +68,31 @@ class MonitorCIGateTests(unittest.TestCase):
                 'work/clean-machine-restore/CLEAN-RESTORE.json',
                 'work/clean-machine-restore/MANIFEST.json',
             ],
+        )
+
+    def test_key_rotation_restore_job_uploads_only_reports(self):
+        workflow = CI_WORKFLOW.read_text()
+        job = workflow.split('\n  key_rotation_restore:\n', 1)[1].split('\n  clean_restore:\n', 1)[0]
+        self.assertIn('    runs-on: ubuntu-24.04\n', job)
+        self.assertIn('    timeout-minutes: 5\n', job)
+        self.assertIn('          persist-credentials: false\n', job)
+        self.assertIn('REVIEWER_PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}', job)
+        self.assertIn(
+            'python3 -I -S -B scripts/key_rotation_restore_drill.py --output work/key-rotation-restore',
+            job,
+        )
+        self.assertNotIn('continue-on-error', job)
+        self.assertNotIn('secrets.', job)
+        self.assertNotIn('permissions:', job)
+        self.assertIn('          retention-days: 30\n', job)
+        actions = [line.split('uses: ', 1)[1] for line in job.splitlines() if 'uses: ' in line]
+        self.assertEqual(len(actions), 2)
+        self.assertRegex(actions[0], r'^actions/checkout@[0-9a-f]{40}(?:\s|$)')
+        self.assertRegex(actions[1], r'^actions/upload-artifact@[0-9a-f]{40}(?:\s|$)')
+        artifact = job.split('          path: |\n', 1)[1].split('          if-no-files-found: error\n', 1)[0]
+        self.assertCountEqual(
+            [line.strip() for line in artifact.splitlines()],
+            ['work/key-rotation-restore/REPORT.json', 'work/key-rotation-restore/MANIFEST.json'],
         )
 
     def test_archive_retry_job_runs_the_vm_and_uploads_only_public_evidence(self):
