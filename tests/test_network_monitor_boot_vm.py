@@ -98,7 +98,7 @@ def evidence_fixture():
                         'nft_returncode': int(failed), 'cleanup': {'ok': True} if failed else None,
                         'failure': 'nftables_rejected' if failed else None},
             'fault_armed': failed, 'namespaces_present': [] if failed else list(namespaces.values()),
-            'receipts': receipts, 'pending': False, 'allocation': {'cycles': len(receipts),
+            'receipts': receipts, 'failed_boot_pending_absent': True if failed else None, 'allocation': {'cycles': len(receipts),
                 'next_port': host.collector.PORT_START + host.collector.PORT_BLOCK * len(receipts)}})
 
     def boot_snapshot(boot_id, at):

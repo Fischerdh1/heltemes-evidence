@@ -50,13 +50,29 @@ class BootGuestTests(unittest.TestCase):
             return observed
         with patch.object(guest.archived, 'readonly_history', reads), \
                 patch.object(guest, 'status', side_effect=inspect) as read_status, \
-                patch.object(guest.archived, 'all_receipts', return_value=[]), \
+                patch.object(guest, 'receipts_at_head', return_value=[]), \
                 patch.object(guest, 'allocation_record', return_value=allocation), \
                 patch.object(guest, 'PRIVATE', Path('/nonexistent/hevidence-test')), \
                 patch.object(guest.time, 'sleep'):
             self.assertEqual(guest.coherent_snapshot('boot', failed=True),
                              (observed, missing, [], allocation))
             read_status.assert_called_once_with()
+
+    def test_active_snapshot_uses_committed_receipts_while_next_cycle_is_allocated(self):
+        history = {'rows': [{'request_id': 'archive_reboot_fixture_3', 'sequence': 4}],
+                   'head_digest': 'head', 'head_sequence': 4}
+        observed = {'ok': True, 'head_digest': 'head', 'committed_count': 4,
+                    'current_evaluation': {'phase': 'fixture', 'status': 'healthy'}}
+        receipts = [{'boot_id': 'boot', 'cycle': cycle} for cycle in (1, 2, 3)]
+        port = guest.collector.PORT_START
+        block = guest.collector.PORT_BLOCK
+        with patch.object(guest.archived, 'readonly_history', return_value=history), \
+                patch.object(guest, 'status', return_value=observed), \
+                patch.object(guest, 'receipts_at_head', return_value=receipts) as read, \
+                patch.object(guest, 'allocation_record', return_value={'cycles': 4, 'next_port': port + 4 * block}):
+            result = guest.coherent_snapshot('boot', failed=False)
+        self.assertEqual(result, (observed, history, receipts, {'cycles': 3, 'next_port': port + 3 * block}))
+        read.assert_called_once_with(history['rows'])
 
     def test_stage_binds_evidence_to_current_boot_after_snapshot(self):
         boot1 = {'boot_id': 'same', 'uptime_seconds': 0.5}

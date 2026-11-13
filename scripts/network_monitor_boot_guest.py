@@ -255,6 +255,13 @@ def allocation_record():
         'next_port': collector.PORT_START, 'cycles': 0}
 
 
+def receipts_at_head(rows):
+    # Files are immutable once published. Select receipts by the saved journal
+    # head instead of scanning a directory that an active collector can extend.
+    return [store.parse(store.read_private(PRIVATE / f"receipt-{row['sequence']:04d}.json"))
+            for row in rows if row['request_id'].startswith('archive_reboot_')]
+
+
 def coherent_snapshot(boot_id, *, failed, timeout=60):
     deadline = time.monotonic() + timeout
     reason = 'no journal snapshot'
@@ -268,23 +275,26 @@ def coherent_snapshot(boot_id, *, failed, timeout=60):
                 reason = 'latest journal row is ' + (rows[-1]['sample']['phase'] if rows else 'absent')
             else:
                 observed = status()
-                if (observed.get('ok') is True and observed['head_digest'] == history['head_digest']
-                        and observed['committed_count'] == history['head_sequence']):
-                    receipts = archived.all_receipts()
-                    allocation = allocation_record()
-                    pending = (PRIVATE / 'pending.json').exists()
-                    bound_receipts = all(r['committed_sequence'] <= history['head_sequence'] for r in receipts)
-                    if not pending and len(receipts) == allocation['cycles'] and bound_receipts:
-                        evaluation = observed['current_evaluation']
-                        current = [r for r in receipts if r['boot_id'] == boot_id]
-                        if failed and evaluation['phase'] == 'collector_missing':
-                            return observed, history, receipts, allocation
-                        if not failed and evaluation['status'] == 'healthy' and len(current) >= 3:
-                            return observed, history, receipts, allocation
-                        reason = f"monitor evaluation is {evaluation['phase']}/{evaluation['status']}"
-                    else:
-                        reason = (f"collector allocation={allocation['cycles']}, receipts={len(receipts)}, "
-                                  f"pending={pending}, receipts_within_head={bound_receipts}")
+                same_head = (observed.get('ok') is True and observed['head_digest'] == history['head_digest']
+                             and observed['committed_count'] == history['head_sequence'])
+                if same_head:
+                    evaluation = observed['current_evaluation']
+                    if (failed and evaluation['phase'] == 'collector_missing') or (
+                            not failed and evaluation['status'] == 'healthy'):
+                        receipts = receipts_at_head(rows)
+                        cycle = receipts[-1]['cycle'] if receipts else 0
+                        boundary = {'cycles': cycle, 'next_port': collector.PORT_START + collector.PORT_BLOCK * cycle}
+                        allocation = allocation_record()
+                        require(allocation['cycles'] >= cycle and allocation['next_port'] ==
+                                collector.PORT_START + collector.PORT_BLOCK * allocation['cycles'],
+                                'The live collector allocation did not cover its committed receipt.')
+                        if failed:
+                            require(allocation == boundary and not (PRIVATE / 'pending.json').exists(),
+                                    'The failed boot changed collector allocation or retained a pending request.')
+                            return observed, history, receipts, boundary
+                        if sum(r['boot_id'] == boot_id for r in receipts) >= 3:
+                            return observed, history, receipts, boundary
+                    reason = f"monitor evaluation is {evaluation['phase']}/{evaluation['status']}"
                 else:
                     reason = 'monitor and journal heads did not match'
         except (OSError, ValueError, store.sqlite3.OperationalError) as error:
@@ -329,7 +339,8 @@ def snapshot(boot_id, *, failed):
     armed = fault_armed()
     require(armed == failed, 'Unexpected firewall fault state for this boot.')
     return {'status': observed, 'history': history, 'services': systemd, 'network': network,
-            'receipts': receipts, 'allocation': allocation, 'pending': False, 'fault_armed': armed,
+            'receipts': receipts, 'allocation': allocation, 'fault_armed': armed,
+            'failed_boot_pending_absent': True if failed else None,
             'units': {role: unit_text(unit) for role, unit in UNITS.items()},
             'storage': archived.storage_info(), 'namespaces_present': present}
 

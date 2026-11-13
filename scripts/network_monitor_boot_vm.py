@@ -253,8 +253,8 @@ def validate_stages(snapshots, source):
         cycle = stage['receipts'][-1]['cycle']
         require(stage['allocation'] == {'cycles': cycle,
                     'next_port': collector.PORT_START + collector.PORT_BLOCK * cycle}
-                and stage['pending'] is False,
-                'Coherent snapshot lost collector allocation or retained pending state.')
+                and stage['failed_boot_pending_absent'] is (True if name == 'failed' else None),
+                'Coherent snapshot lost committed allocation or a failed boot retained pending state.')
         group = []
         for row in rows[start + 1:end]:
             if row['sequence'] in by_sequence:
