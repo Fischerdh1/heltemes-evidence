@@ -58,6 +58,9 @@ def unit_text(unit):
         behavior = 'Type=notify\nNotifyAccess=main\nKillMode=mixed\nTimeoutStartSec=45\n'
     else:
         behavior = 'Type=exec\n'
+    if role == 'collector':
+        # Stop the producer first and let its bounded in-flight probes finish.
+        behavior += 'KillMode=mixed\n'
     if role == 'monitor':
         behavior += f'ProtectSystem=strict\nReadWritePaths={STATE}\nRestrictAddressFamilies=AF_UNIX\n'
     return f'''[Unit]
@@ -248,39 +251,46 @@ def install():
 
 def allocation_record():
     path = PRIVATE / 'allocation.json'
-    return archived.read_private(path, 1024) if path.exists() else {'next_port': collector.PORT_START, 'cycles': 0}
+    return store.parse(store.read_private(path, limit=1024)) if path.exists() else {
+        'next_port': collector.PORT_START, 'cycles': 0}
 
 
 def coherent_snapshot(boot_id, *, failed, timeout=60):
     deadline = time.monotonic() + timeout
+    reason = 'no journal snapshot'
     while time.monotonic() < deadline:
         try:
             history = archived.readonly_history()
-            # Check for a persisted gap before issuing any status request.
-            # Otherwise a status call could itself cause the deadline to be recorded.
-            if failed and (not history['rows'] or
-                           history['rows'][-1]['sample']['phase'] != 'collector_missing'):
-                time.sleep(0.12)
-                continue
-            observed = status()
-            if (observed.get('ok') is True and observed['head_digest'] == history['head_digest']
-                    and observed['committed_count'] == history['head_sequence']):
-                receipts = archived.all_receipts()
-                allocation = allocation_record()
-                pending = (PRIVATE / 'pending.json').exists()
-                evaluation = observed['current_evaluation']
-                if (not pending and len(receipts) == allocation['cycles']
-                        and all(r['committed_sequence'] <= history['head_sequence'] for r in receipts)):
-                    if failed and evaluation['phase'] == 'collector_missing':
-                        return observed, history, receipts, allocation
-                    if not failed and evaluation['status'] == 'healthy':
+            rows = history['rows']
+            # Read the persisted gap before any status request. This proves the
+            # monitor's own timer committed it without a harness request.
+            if failed and (not rows or rows[-1]['sample']['phase'] != 'collector_missing'):
+                reason = 'latest journal row is ' + (rows[-1]['sample']['phase'] if rows else 'absent')
+            else:
+                observed = status()
+                if (observed.get('ok') is True and observed['head_digest'] == history['head_digest']
+                        and observed['committed_count'] == history['head_sequence']):
+                    receipts = archived.all_receipts()
+                    allocation = allocation_record()
+                    pending = (PRIVATE / 'pending.json').exists()
+                    bound_receipts = all(r['committed_sequence'] <= history['head_sequence'] for r in receipts)
+                    if not pending and len(receipts) == allocation['cycles'] and bound_receipts:
+                        evaluation = observed['current_evaluation']
                         current = [r for r in receipts if r['boot_id'] == boot_id]
-                        if len(current) >= 3:
+                        if failed and evaluation['phase'] == 'collector_missing':
                             return observed, history, receipts, allocation
-        except (OSError, ValueError, store.sqlite3.OperationalError):
-            pass
+                        if not failed and evaluation['status'] == 'healthy' and len(current) >= 3:
+                            return observed, history, receipts, allocation
+                        reason = f"monitor evaluation is {evaluation['phase']}/{evaluation['status']}"
+                    else:
+                        reason = (f"collector allocation={allocation['cycles']}, receipts={len(receipts)}, "
+                                  f"pending={pending}, receipts_within_head={bound_receipts}")
+                else:
+                    reason = 'monitor and journal heads did not match'
+        except (OSError, ValueError, store.sqlite3.OperationalError) as error:
+            reason = type(error).__name__ + ' reading bounded boot state'
         time.sleep(0.12)
-    raise RuntimeError('A coherent automatic boot snapshot was unavailable.')
+    raise RuntimeError('A coherent automatic boot snapshot was unavailable: ' + reason + '.')
 
 
 def snapshot(boot_id, *, failed):

@@ -1,0 +1,73 @@
+"""Local contract checks for the boot-owned network and its failure gate."""
+from pathlib import Path
+import subprocess
+import unittest
+from unittest.mock import Mock, patch
+
+from scripts import network_monitor_boot_guest as guest
+
+
+class BootGuestTests(unittest.TestCase):
+    def test_monitor_is_independent_and_collector_waits_for_network_readiness(self):
+        monitor, network, collector = (guest.unit_text(unit) for unit in guest.UNITS.values())
+        for text in (monitor, network, collector):
+            self.assertIn('WantedBy=multi-user.target', text)
+        self.assertNotIn(guest.NETWORK_UNIT, monitor)
+        self.assertNotIn(guest.COLLECTOR_UNIT, monitor)
+        self.assertIn('Type=notify', network)
+        self.assertIn('NotifyAccess=main', network)
+        self.assertIn('KillMode=mixed', network)
+        self.assertIn('KillMode=mixed', collector)
+        self.assertIn(f'BindsTo={guest.NETWORK_UNIT}', collector)
+        self.assertIn(f'Requires={guest.MONITOR_UNIT}', collector)
+        self.assertIn(f'After={guest.NETWORK_UNIT} {guest.MONITOR_UNIT}', collector)
+        for text in (network, collector):
+            self.assertNotIn('ProtectSystem', text)
+            self.assertNotIn('PrivateMounts', text)
+
+    def test_firewall_failure_is_a_real_batch_scoped_to_owned_router(self):
+        lab = Mock(tools={'nft': '/usr/sbin/nft'})
+        lab.ruleset.return_value = {'nftables': [{'metainfo': {}}]}
+        lab.run_in.return_value = subprocess.CompletedProcess([], 1, '', 'syntax error')
+        approved = guest.automatic.monitoring.segmentation.policy_text()
+        self.assertEqual(guest.firewall(lab, True).returncode, 1)
+        lab.run_in.assert_called_once_with('router', ['/usr/sbin/nft', '-f', '-'],
+                                          input=approved + guest.BAD_NFT_LINE, check=False)
+        lab.ruleset.return_value = {'nftables': [{'table': {'name': 'unexpected'}}]}
+        with self.assertRaisesRegex(RuntimeError, 'left rules'):
+            guest.firewall(lab, True)
+
+    def test_gap_must_persist_before_harness_reads_monitor_status(self):
+        previous = {'rows': [{'sample': {'phase': 'monitor_restart'}}]}
+        missing = {'rows': [{'sample': {'phase': 'collector_missing'}}],
+                   'head_digest': 'head', 'head_sequence': 2}
+        observed = {'ok': True, 'head_digest': 'head', 'committed_count': 2,
+                    'current_evaluation': {'phase': 'collector_missing', 'status': 'unknown'}}
+        allocation = {'cycles': 0, 'next_port': 42000}
+        reads = Mock(side_effect=(previous, missing))
+        def inspect():
+            self.assertEqual(reads.call_count, 2)
+            return observed
+        with patch.object(guest.archived, 'readonly_history', reads), \
+                patch.object(guest, 'status', side_effect=inspect) as read_status, \
+                patch.object(guest.archived, 'all_receipts', return_value=[]), \
+                patch.object(guest, 'allocation_record', return_value=allocation), \
+                patch.object(guest, 'PRIVATE', Path('/nonexistent/hevidence-test')), \
+                patch.object(guest.time, 'sleep'):
+            self.assertEqual(guest.coherent_snapshot('boot', failed=True),
+                             (observed, missing, [], allocation))
+            read_status.assert_called_once_with()
+
+    def test_stage_binds_evidence_to_current_boot_after_snapshot(self):
+        boot1 = {'boot_id': 'same', 'uptime_seconds': 0.5}
+        boot2 = {'boot_id': 'same', 'uptime_seconds': 12}
+        with patch.object(guest, 'guard', return_value='qemu'), \
+                patch.object(guest.reboot, 'boot_info', side_effect=(boot1, boot2)), \
+                patch.object(guest, 'snapshot', return_value={}) as snapshot:
+            result = guest.stage('normal', 'token')
+        self.assertEqual(result['boot'], boot2)
+        snapshot.assert_called_once_with('same', failed=False)
+
+
+if __name__ == '__main__':
+    unittest.main()
