@@ -74,6 +74,58 @@ class BootGuestTests(unittest.TestCase):
         self.assertEqual(result, (observed, history, receipts, {'cycles': 3, 'next_port': port + 3 * block}))
         read.assert_called_once_with(history['rows'])
 
+    def powercut_receipt(self, **overrides):
+        receipt = {
+            'boot_id': '97c110dd-d2bc-45d0-b25e-912ed18dd022',
+            'process_id': 42, 'instance_id': 'a' * 32, 'cycle': 3,
+            'committed_sequence': 4, 'request': {'request_id': 'archive_reboot_fixture_3',
+                                                 'observation': {'probes': [{}, {}, {}]}},
+            'evaluation': {'status': 'healthy'},
+        }
+        receipt.update(delivery_boot_id=receipt['boot_id'], delivery_process_id=receipt['process_id'])
+        receipt.update(overrides)
+        return receipt
+
+    def test_previous_boot_arm_does_not_trigger_current_boot(self):
+        boot_id = self.powercut_receipt()['boot_id']
+        with patch.object(guest.os.path, 'lexists', return_value=True), \
+                patch.object(guest.store, 'read_private', return_value=(
+                    b'{"boot_id":"ed27207d-4301-42f9-95d3-27c05cc67bc5"}')):
+            self.assertFalse(guest.powercut_armed(boot_id))
+
+    def test_armed_collector_publishes_post_commit_boundary_and_honors_stop(self):
+        receipt = self.powercut_receipt()
+        allocation = Mock(directory=Path('/nonexistent/hevidence-test'))
+        allocation.read.return_value = {'cycles': receipt['cycle']}
+        worker = guest.BootCollector(Mock(), allocation, boot_id=receipt['boot_id'], phase='before')
+        receipt.update(process_id=worker.process_id, delivery_process_id=worker.process_id,
+                       instance_id=worker.instance_id)
+        with patch.object(guest.collector.Collector, 'collect', return_value=receipt) as collect, \
+                patch.object(guest, 'powercut_armed', return_value=True), \
+                patch.object(guest.ordinary_collector, 'replace_private') as publish, \
+                patch.object(guest.time, 'sleep', side_effect=lambda duration: worker.stop()) as sleep:
+            self.assertEqual(worker.collect(), receipt)
+        collect.assert_called_once_with()
+        publish.assert_called_once_with(guest.POWER_CUT_BOUNDARY, guest.cut_boundary(receipt))
+        sleep.assert_called_once_with(0.1)
+
+    def test_cut_snapshot_includes_autonomous_freshness_gap_after_held_receipt(self):
+        receipt = self.powercut_receipt()
+        receipts = [receipt, receipt, receipt]
+        boundary = guest.cut_boundary(receipt)
+        history = {'rows': [{'sample': {'phase': 'collector_missing'}}],
+                   'head_digest': 'head', 'head_sequence': 5}
+        observed = {'ok': True, 'head_digest': 'head', 'committed_count': 5,
+                    'current_evaluation': {'phase': 'collector_missing', 'status': 'unknown'}}
+        allocation = {'cycles': 3, 'next_port': guest.collector.PORT_START + guest.collector.PORT_BLOCK * 3}
+        with patch.object(guest.archived, 'readonly_history', return_value=history), \
+                patch.object(guest, 'status', return_value=observed), \
+                patch.object(guest, 'receipts_at_head', return_value=receipts), \
+                patch.object(guest, 'allocation_record', return_value=allocation), \
+                patch.object(guest, 'PRIVATE', Path('/nonexistent/hevidence-test')):
+            result = guest.coherent_snapshot(receipt['boot_id'], failed=False, powercut_boundary=boundary)
+        self.assertEqual(result, (observed, history, receipts, allocation))
+
     def test_stage_binds_evidence_to_current_boot_after_snapshot(self):
         boot1 = {'boot_id': 'same', 'uptime_seconds': 0.5}
         boot2 = {'boot_id': 'same', 'uptime_seconds': 12}

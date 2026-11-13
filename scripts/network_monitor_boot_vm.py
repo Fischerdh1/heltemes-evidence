@@ -180,9 +180,10 @@ def validate_snapshot(stage, name, source, first):
                 and 0 < network['ActiveEnterTimestampMonotonic'] <= worker['ExecMainStartTimestampMonotonic']
                 <= uptime * 1_000_000 and reboot.TOKEN.fullmatch(worker['InvocationID']),
                 'Collector started before boot-scoped network readiness.')
-        require(status['current_evaluation']['status'] == 'healthy'
-                and status['freshness']['last_accepted_request_id'] == rows[-1]['request_id'],
-                'The current boot did not establish fresh healthy coverage.')
+        if name != 'inspect-powercut':
+            require(status['current_evaluation']['status'] == 'healthy'
+                    and status['freshness']['last_accepted_request_id'] == rows[-1]['request_id'],
+                    'The current boot did not establish fresh healthy coverage.')
     return rows
 
 

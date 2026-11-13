@@ -28,6 +28,8 @@ from scripts import network_monitor_store as store
 DATA, STATE, PRIVATE = collector.DATA, collector.STATE, collector.PRIVATE
 RUNTIME = Path('/run/heltemes-automatic-boot-lab')
 NETWORK_STATE = RUNTIME / 'network.json'
+POWER_CUT_ARM = RUNTIME / 'powercut-arm.json'
+POWER_CUT_BOUNDARY = RUNTIME / 'powercut-boundary.json'
 FAULT = DATA / 'inject-firewall-failure'
 MONITOR_UNIT = 'heltemes-boot-monitor.service'
 NETWORK_UNIT = 'heltemes-boot-network.service'
@@ -81,7 +83,8 @@ WantedBy=multi-user.target
 
 def guard(token):
     virtualization = reboot.guard(token)
-    paths = (DATA, STATE, PRIVATE, RUNTIME, NETWORK_STATE, FAULT, collector.CONFIG,
+    paths = (DATA, STATE, PRIVATE, RUNTIME, NETWORK_STATE, POWER_CUT_ARM, POWER_CUT_BOUNDARY,
+             FAULT, collector.CONFIG,
              *(unit_path(unit) for unit in UNITS.values()))
     require(not any(part.is_symlink() for path in paths for part in (path, *path.parents)),
             'Automatic boot paths must not traverse links.')
@@ -204,6 +207,69 @@ def monitor_worker():
     service.serve(STATE, freshness_seconds=FRESHNESS_SECONDS, archive_history=True, diagnose_rejections=True)
 
 
+def powercut_armed(boot_id):
+    if not os.path.lexists(POWER_CUT_ARM):
+        return False
+    marker = store.parse(store.read_private(POWER_CUT_ARM, limit=1024))
+    require(set(marker) == {'boot_id'} and isinstance(marker['boot_id'], str)
+            and collector.BOOT_ID.fullmatch(marker['boot_id']), 'Invalid power-cut arm marker.')
+    return marker['boot_id'] == boot_id
+
+
+def cut_boundary(receipt):
+    return {
+        'boot_id': receipt['boot_id'], 'process_id': receipt['process_id'],
+        'instance_id': receipt['instance_id'], 'cycle': receipt['cycle'],
+        'committed_sequence': receipt['committed_sequence'],
+        'request_id': receipt['request']['request_id'],
+    }
+
+
+def healthy_canaries(receipt):
+    return (receipt['evaluation']['status'] == 'healthy'
+            and len(receipt['request']['observation']['probes']) == len(automatic.monitoring.CANARIES))
+
+
+class BootCollector(collector.Collector):
+    """Pause only the disposable collector at a fully acknowledged boundary."""
+
+    def collect(self):
+        receipt = super().collect()  # Receipt synced and pending request removed.
+        if (not self.stopping and receipt['boot_id'] == receipt['delivery_boot_id'] == self.boot_id
+                and receipt['process_id'] == receipt['delivery_process_id'] == self.process_id
+                and healthy_canaries(receipt)
+                and powercut_armed(self.boot_id)):
+            require(not os.path.lexists(self.pending) and self.allocation.read()['cycles'] == receipt['cycle'],
+                    'The power-cut boundary does not have a complete collector commit.')
+            ordinary_collector.replace_private(POWER_CUT_BOUNDARY, cut_boundary(receipt))
+            while not self.stopping:
+                time.sleep(0.1)
+        return receipt
+
+
+def arm_powercut(boot_id):
+    store.state_path(RUNTIME)
+    observing = manager(COLLECTOR_UNIT)
+    require(not fault_armed() and observing['ActiveState'] == 'active' and observing['MainPID'] > 0
+            and not any(os.path.lexists(path) for path in (POWER_CUT_ARM, POWER_CUT_BOUNDARY)),
+            'Power cut can only be armed once on an active, fault-free boot.')
+    ordinary_collector.replace_private(POWER_CUT_ARM, {'boot_id': boot_id})
+    return {'powercut_armed': True}
+
+
+def wait_cut_boundary(boot_id, timeout=70):
+    deadline = time.monotonic() + timeout
+    while not os.path.lexists(POWER_CUT_BOUNDARY):
+        require(time.monotonic() < deadline, 'The active collector never reached a healthy cut boundary.')
+        time.sleep(0.12)
+    boundary = store.parse(store.read_private(POWER_CUT_BOUNDARY, limit=1024))
+    require(powercut_armed(boot_id) and boundary['boot_id'] == boot_id
+            and set(boundary) == {'boot_id', 'process_id', 'instance_id', 'cycle',
+                                  'committed_sequence', 'request_id'},
+            'Power-cut boundary did not belong to the armed boot.')
+    return boundary
+
+
 def collector_worker():
     worker_guard()
     network = store.parse(store.read_private(NETWORK_STATE, limit=4096))
@@ -215,7 +281,7 @@ def collector_worker():
         'version': 1, 'interval_seconds': ordinary_collector.INTERVAL, 'namespaces': network['namespaces']})
     allocation = collector.Allocation(PRIVATE)
     try:
-        worker = collector.Collector(attached, allocation, boot_id=boot, phase='before')
+        worker = BootCollector(attached, allocation, boot_id=boot, phase='before')
         signal.signal(signal.SIGTERM, worker.stop)
         signal.signal(signal.SIGINT, worker.stop)
         worker.run()
@@ -262,7 +328,7 @@ def receipts_at_head(rows):
             for row in rows if row['request_id'].startswith('archive_reboot_')]
 
 
-def coherent_snapshot(boot_id, *, failed, timeout=60):
+def coherent_snapshot(boot_id, *, failed, powercut_boundary=None, timeout=60):
     deadline = time.monotonic() + timeout
     reason = 'no journal snapshot'
     while time.monotonic() < deadline:
@@ -280,7 +346,7 @@ def coherent_snapshot(boot_id, *, failed, timeout=60):
                 if same_head:
                     evaluation = observed['current_evaluation']
                     if (failed and evaluation['phase'] == 'collector_missing') or (
-                            not failed and evaluation['status'] == 'healthy'):
+                            not failed and (powercut_boundary or evaluation['status'] == 'healthy')):
                         receipts = receipts_at_head(rows)
                         cycle = receipts[-1]['cycle'] if receipts else 0
                         boundary = {'cycles': cycle, 'next_port': collector.PORT_START + collector.PORT_BLOCK * cycle}
@@ -292,6 +358,11 @@ def coherent_snapshot(boot_id, *, failed, timeout=60):
                             require(allocation == boundary and not (PRIVATE / 'pending.json').exists(),
                                     'The failed boot changed collector allocation or retained a pending request.')
                             return observed, history, receipts, boundary
+                        if powercut_boundary:
+                            require(receipts and cut_boundary(receipts[-1]) == powercut_boundary
+                                    and healthy_canaries(receipts[-1]) and allocation == boundary
+                                    and not os.path.lexists(PRIVATE / 'pending.json'),
+                                    'Collector advanced past its claimed cut boundary.')
                         if sum(r['boot_id'] == boot_id for r in receipts) >= 3:
                             return observed, history, receipts, boundary
                     reason = f"monitor evaluation is {evaluation['phase']}/{evaluation['status']}"
@@ -303,8 +374,9 @@ def coherent_snapshot(boot_id, *, failed, timeout=60):
     raise RuntimeError('A coherent automatic boot snapshot was unavailable: ' + reason + '.')
 
 
-def snapshot(boot_id, *, failed):
-    observed, history, receipts, allocation = coherent_snapshot(boot_id, failed=failed)
+def snapshot(boot_id, *, failed, powercut_boundary=None):
+    observed, history, receipts, allocation = coherent_snapshot(
+        boot_id, failed=failed, powercut_boundary=powercut_boundary)
     systemd = {role: manager(unit) for role, unit in UNITS.items()}
     network = store.parse(store.read_private(NETWORK_STATE, limit=4096))
     present = namespaces_present()
@@ -338,11 +410,16 @@ def snapshot(boot_id, *, failed):
                 'Topology or collector did not start in the required order.')
     armed = fault_armed()
     require(armed == failed, 'Unexpected firewall fault state for this boot.')
-    return {'status': observed, 'history': history, 'services': systemd, 'network': network,
-            'receipts': receipts, 'allocation': allocation, 'fault_armed': armed,
-            'failed_boot_pending_absent': True if failed else None,
-            'units': {role: unit_text(unit) for role, unit in UNITS.items()},
-            'storage': archived.storage_info(), 'namespaces_present': present}
+    result = {'status': observed, 'history': history, 'services': systemd, 'network': network,
+              'receipts': receipts, 'allocation': allocation, 'fault_armed': armed,
+              'failed_boot_pending_absent': True if failed else None,
+              'units': {role: unit_text(unit) for role, unit in UNITS.items()},
+              'storage': archived.storage_info(), 'namespaces_present': present}
+    if powercut_boundary:
+        require(observing['MainPID'] == powercut_boundary['process_id'],
+                'The collector that published the cut boundary is no longer active.')
+        result['powercut_boundary'] = powercut_boundary
+    return result
 
 
 def cleanup():
@@ -389,10 +466,17 @@ def stage(name, token):
     boot = reboot.boot_info(virtualization)
     if name == 'install':
         result = install()
-    elif name in ('baseline', 'normal', 'failed', 'recovered'):
-        result = snapshot(boot['boot_id'], failed=name == 'failed')
+    elif name in ('baseline', 'normal', 'failed', 'recovered', 'inspect-powercut'):
+        if name == 'inspect-powercut':
+            result = snapshot(boot['boot_id'], failed=False,
+                              powercut_boundary=wait_cut_boundary(boot['boot_id']))
+        else:
+            result = snapshot(boot['boot_id'], failed=name == 'failed')
+
         expected = {source: hashlib.sha256((ROOT / source).read_bytes()).hexdigest() for source in SOURCE_FILES}
         result['source_sha256'] = expected
+    elif name == 'arm-powercut':
+        result = arm_powercut(boot['boot_id'])
     elif name == 'arm-failure':
         store.state_path(DATA)
         write_new(FAULT, FAULT_CONTENT)
@@ -416,7 +500,8 @@ def main():
                'collector-worker': collector_worker}
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('stage', choices=('install', 'baseline', 'normal', 'arm-failure',
-        'failed', 'disarm-failure', 'recovered', 'cleanup', 'diagnostic', *workers))
+        'failed', 'disarm-failure', 'recovered', 'arm-powercut', 'inspect-powercut',
+        'cleanup', 'diagnostic', *workers))
     parser.add_argument('--token')
     args = parser.parse_args()
     try:
