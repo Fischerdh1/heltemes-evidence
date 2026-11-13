@@ -29,6 +29,17 @@ The implementation uses SQLite's `synchronous=EXTRA` setting with rollback-journ
 
 ## Repeatable VM exercise
 
+The exercise checks collector identity while the services are running. If it detects an unexpected restart, it keeps the failure and retains `COLLECTOR-RESTART.json` with the old and new process identities, systemd's restart count and bounded unit diagnostics. The failure artifact is separate from the successful archive report.
+
+To verify this failure path in a disposable VM, run:
+
+```sh
+mkdir -p work
+python3 -I -S -B scripts/network_monitor_archive_vm.py --output work/archive-restart-drill --reproduce-collector-restart
+```
+
+The drill deliberately kills the collector after its first saved receipt. It succeeds only when the regular exercise rejects the restart, systemd reports the replacement and the kill signal, and the VM is removed.
+
 On a disposable x86-64 Linux host with the documented QEMU prerequisites:
 
 ```sh

@@ -245,6 +245,31 @@ class ArchiveHostTests(unittest.TestCase):
         self.assertLess(len(str(caught.exception)), 12500)
         self.assertFalse(ssh.call_args.kwargs['check'])
 
+    def test_injected_restart_requires_actual_exit_and_replacement_evidence(self):
+        initial = {'MainPID': 40, 'NRestarts': 0, 'ExecMainStartTimestampMonotonic': 10, 'InvocationID': 'a' * 32}
+        current = {'MainPID': 41, 'NRestarts': 1, 'ExecMainStartTimestampMonotonic': 20, 'InvocationID': 'b' * 32}
+        diagnostic = {'format': 'heltemes-archive-collector-restart-diagnostic', 'version': 1,
+                      'stage': 'collector_identity_verification',
+                      'error': 'The autonomous collector unexpectedly restarted.', 'injected': True,
+                      'initial': initial, 'current': current,
+                      'first_receipt': {'cycle': 1, 'committed_sequence': 2, 'process_id': 40, 'delivery_process_id': 40},
+                      'bounded_unit_diagnostics': {lab.COLLECTOR_UNIT: {
+                          'recent_log': 'Main process exited, code=killed, status=9/KILL'}}}
+        line = lab.RESTART_DIAGNOSTIC_PREFIX + json.dumps(diagnostic)
+        self.assertEqual(lab.read_restart_diagnostics(line), diagnostic)
+        lab.validate_injected_restart(diagnostic)
+        for key, value in (('MainPID', 40), ('NRestarts', 0), ('InvocationID', 'a' * 32)):
+            changed = copy.deepcopy(diagnostic)
+            changed['current'][key] = value
+            with self.subTest(key=key), self.assertRaises(RuntimeError):
+                lab.validate_injected_restart(changed)
+        changed = copy.deepcopy(diagnostic)
+        changed['bounded_unit_diagnostics'][lab.COLLECTOR_UNIT]['recent_log'] = 'status=1/FAILURE'
+        with self.assertRaises(RuntimeError):
+            lab.validate_injected_restart(changed)
+        self.assertIsNone(lab.read_restart_diagnostics(line + '\n' + line))
+        self.assertIsNone(lab.read_restart_diagnostics(line + ' ' * lab.MAX_RESTART_DIAGNOSTIC))
+
     def test_complete_archive_lifecycle_and_original_segments_are_accepted(self):
         report, files = archive_fixture()
         lab.validate_lifecycle(report)

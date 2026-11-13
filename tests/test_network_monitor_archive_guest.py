@@ -1,5 +1,11 @@
 """Portable contract checks for guarded archive VM exercise and receipt verification."""
 import copy
+from contextlib import redirect_stderr
+import io
+import json
+from pathlib import Path
+import subprocess
+import tempfile
 import unittest
 from unittest.mock import MagicMock, patch
 from scripts import network_monitor_archive_guest as guest
@@ -68,28 +74,32 @@ class ArchiveGuestTests(unittest.TestCase):
             self.assertIn('critical_ids', str(caught.exception))
 
     def test_failure_diagnostics_read_only_fixed_units_and_sanitize_bounded_logs(self):
-        import subprocess
         def run(arguments, **kwargs):
             if arguments[0] == 'systemctl':
-                text = 'MainPID=123\nNRestarts=1\nResult=exit-code\nUnrequestedField=omit-me\n'
+                text = 'MainPID=123\nNRestarts=1\nResult=exit-code\nUnrequestedField=omit-me\nSubState=/var/private/secret\n'
             else:
+                unit = arguments[-1].removeprefix('--unit=')
                 text = ('private /var/private/secret ' + 'a' * 64 + '\n') * 100
+                text += f'{unit}: Main process exited, code=killed, status=9/KILL\n'
+                text += f'{unit}: Main process exited, code=killed, status=9/KILL /var/private/secret\n'
+                text += 'Monitor request rejected: source_timestamp_before_boundary\n'
+                text += 'Monitor request rejected: /var/private/secret\n'
             return subprocess.CompletedProcess(arguments, 0, text, '')
         with patch.object(guest, 'command', side_effect=run) as command:
             result = guest.diagnostics()
         self.assertEqual(set(result), {guest.MONITOR_UNIT, guest.COLLECTOR_UNIT})
         self.assertEqual(command.call_count, 4)
         for record in result.values():
-            self.assertNotIn('UnrequestedField', record['service'])
+            self.assertEqual(record['service'], {'MainPID': '123', 'NRestarts': '1', 'Result': 'exit-code'})
+            self.assertIn('status=9/KILL', record['recent_log'])
             self.assertNotIn('/var/private/secret', record['recent_log'])
             self.assertNotIn('a' * 64, record['recent_log'])
             self.assertLessEqual(len(record['recent_log'].splitlines()), 12)
         self.assertTrue(all(call.kwargs['timeout'] == 5 for call in command.call_args_list))
+        self.assertIn('source_timestamp_before_boundary', result[guest.MONITOR_UNIT]['recent_log'])
+        self.assertNotIn('source_timestamp_before_boundary', result[guest.COLLECTOR_UNIT]['recent_log'])
 
     def test_collector_diagnostic_reports_shape_and_hash_without_observation_contents(self):
-        import json
-        import tempfile
-        from pathlib import Path
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory).resolve()
             path.chmod(0o700)
@@ -184,7 +194,7 @@ class ArchiveGuestTests(unittest.TestCase):
             payload = {'command': 'observe', 'request_id': name, 'observation': observation}
             evaluation = {'status': 'critical' if probes else 'unknown'}
             records.append({'instance_id': 'a' * 32, 'process_id': 123, 'cycle': cycle, 'request': payload,
-                            'committed_sequence': sequence, 'evaluation': evaluation,
+                            'delivery_process_id': 123, 'committed_sequence': sequence, 'evaluation': evaluation,
                             'duplicate_acknowledgement': cycle in (127, 254),
                             'delivery_attempts': 2 if cycle in (127, 254) else 1,
                             'transport_failures': ['ConnectionResetError'] if cycle in (127, 254) else []})
@@ -212,6 +222,94 @@ class ArchiveGuestTests(unittest.TestCase):
         broken[15]['request']['observation']['probes'][0]['source_port'] = 42006
         with self.assertRaises(RuntimeError):
             guest.validate_inventory(journal, broken, crashes)
+
+
+    def collector_manager(self, pid=123, restarts=0, *, active='active', substate='running'):
+        return {'MainPID': pid, 'NRestarts': restarts, 'ActiveState': active, 'SubState': substate,
+                'ExecMainStartTimestampMonotonic': pid + 100, 'InvocationID': f'{pid:032x}'}
+
+    def test_continuity_rejects_unexpected_restart_and_permits_clean_exit(self):
+        continuity = guest.CollectorContinuity(inject=False)
+        continuity.check(self.collector_manager())
+        continuity.check(self.collector_manager(0, active='inactive', substate='dead'))
+        for replacement in (self.collector_manager(0, 1, active='activating', substate='auto-restart'),
+                            self.collector_manager(124, 1), self.collector_manager(124)):
+            with self.assertRaisesRegex(guest.CollectorRestartError, 'collector_identity_verification') as caught:
+                continuity.check(replacement)
+            self.assertEqual(caught.exception.current, replacement)
+
+    def test_late_inventory_preserves_mixed_producer_and_delivery_evidence(self):
+        for field, value in (('process_id', 124), ('delivery_process_id', 124), ('instance_id', 'b' * 32)):
+            journal, records, crashes = self.inventory()
+            records[5][field] = value
+            with self.assertRaisesRegex(guest.CollectorRestartError, 'receipt_history_verification') as caught:
+                guest.stage_call('receipt_history_verification', lambda: guest.validate_inventory(journal, records, crashes))
+            self.assertEqual(caught.exception.first['committed_sequence'], 2)
+            self.assertEqual(caught.exception.differing['cycle'], 6)
+            self.assertNotIn('request', caught.exception.differing)
+
+    def test_guarded_injection_uses_normal_check_and_reports_bounded_signal_evidence(self):
+        original, replacement = self.collector_manager(), self.collector_manager(124, 1)
+        continuity = guest.CollectorContinuity(inject=True)
+        continuity.check(original)
+        _, records, _ = self.inventory()
+        with patch.object(guest, 'manager', side_effect=[original, replacement]), \
+                patch.object(guest, 'collector_diagnostic', return_value={'runtime.json': {'state': 'idle', 'cycle': 1}}), \
+                patch.object(guest, 'read_receipt', return_value=records[0]) as read, \
+                patch.object(guest, 'request', return_value={'ok': True, 'committed_count': 2, 'process_id': 777}), \
+                patch.object(guest, 'command') as command:
+            with self.assertRaisesRegex(guest.CollectorRestartError, guest.COLLECTOR_RESTART) as caught:
+                continuity.reproduce()
+            read.assert_called_once_with(guest.PRIVATE / 'receipt-0002.json')
+            command.assert_called_once_with(['systemctl', 'kill', '--kill-who=main', '--signal=KILL', guest.COLLECTOR_UNIT])
+        logs = {guest.COLLECTOR_UNIT: {'recent_log': 'Main process exited, code=killed, status=9/KILL'}}
+        output = io.StringIO()
+        with redirect_stderr(output), patch.object(guest, 'diagnostics', return_value=logs):
+            continuity.report(caught.exception)
+        line = output.getvalue().strip()
+        self.assertLessEqual(len(line.encode()), guest.MAX_RESTART_DIAGNOSTIC)
+        self.assertTrue(line.startswith(guest.RESTART_DIAGNOSTIC_PREFIX))
+        report = json.loads(line.removeprefix(guest.RESTART_DIAGNOSTIC_PREFIX))
+        self.assertTrue(report['injected'])
+        self.assertEqual(report['current']['MainPID'], 124)
+        self.assertEqual(report['current']['NRestarts'], 1)
+        self.assertEqual(report['first_receipt']['delivery_process_id'], report['initial']['MainPID'])
+        self.assertEqual(report['last_monitor_status']['committed_count'], 2)
+        self.assertEqual(report['bounded_unit_diagnostics'], logs)
+
+    def test_diagnostic_and_cleanup_failures_preserve_original_stage(self):
+        failure = guest.CollectorRestartError('collector_identity_verification', current=self.collector_manager(124, 1))
+        output = io.StringIO()
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            data, report = root / 'data', root / 'data' / 'report'
+            lab = MagicMock()
+            lab.cleanup.side_effect = RuntimeError('cleanup failure')
+            def diagnostic(error):
+                self.assertIs(error, failure)
+                self.assertEqual(lab.cleanup.call_count, 0)
+                raise OSError('diagnostic failure')
+            with redirect_stderr(output), patch.multiple(guest, DATA=data, REPORT=report, PUBLISH=report / 'publish', RUNTIME=root / 'run'), \
+                    patch.object(guest, 'guard'), patch.object(guest.reboot, 'boot_info'), patch.object(guest.reboot.base, 'preflight'), \
+                    patch.object(guest.automatic.monitoring, 'MonitoringLab', return_value=lab), \
+                    patch.object(guest, 'unit_path', return_value=root / 'absent'), \
+                    patch.object(guest.CollectorContinuity, 'report', side_effect=diagnostic), \
+                    patch.object(guest, 'run_exercise', side_effect=failure):
+                with self.assertRaises(guest.CollectorRestartError) as caught:
+                    guest.exercise('token')
+        self.assertIs(caught.exception, failure)
+        lab.cleanup.assert_called_once()
+        self.assertIn(guest.COLLECTOR_RESTART, output.getvalue())
+
+    def test_injection_flag_is_rejected_for_worker_and_cleanup(self):
+        for stage in ('worker', 'cleanup'):
+            with patch.object(guest.sys, 'argv', ['guest', stage, '--inject-collector-restart']), \
+                    patch.object(guest, 'worker') as worker, patch.object(guest, 'cleanup') as cleanup, redirect_stderr(io.StringIO()):
+                with self.assertRaises(SystemExit) as caught:
+                    guest.main()
+            self.assertEqual(caught.exception.code, 2)
+            worker.assert_not_called()
+            cleanup.assert_not_called()
 
 
 if __name__ == '__main__':

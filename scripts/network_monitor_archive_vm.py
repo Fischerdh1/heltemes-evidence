@@ -6,6 +6,7 @@ import hashlib
 import io
 import json
 from pathlib import Path
+import re
 import subprocess
 import sys
 import tarfile
@@ -29,6 +30,51 @@ SEGMENT_FILES = ('archive-segment-000001.json', 'archive-segment-000002.json')
 GUEST_FILES = (*GUEST_FILES, *SEGMENT_FILES)
 MAX_EXPORT = 64 * 1024 * 1024
 PUBLIC_FILES = ('REPORT.json', 'VM.json', 'SUMMARY.md', *GUEST_FILES)
+RESTART_DIAGNOSTIC_PREFIX = 'Archive collector restart diagnostics: '
+COLLECTOR_UNIT = 'heltemes-archive-collector.service'
+MAX_RESTART_DIAGNOSTIC = 8192
+
+
+class GuestStageFailed(RuntimeError):
+    def __init__(self, message, diagnostics=None):
+        super().__init__(message)
+        self.diagnostics = diagnostics
+
+
+def read_restart_diagnostics(stderr):
+    lines = [line for line in stderr.splitlines() if line.startswith(RESTART_DIAGNOSTIC_PREFIX)]
+    if len(lines) != 1 or len(lines[0].encode()) > MAX_RESTART_DIAGNOSTIC:
+        return None
+    try:
+        value = json.loads(lines[0][len(RESTART_DIAGNOSTIC_PREFIX):])
+    except ValueError:
+        return None
+    if (isinstance(value, dict) and value.get('format') == 'heltemes-archive-collector-restart-diagnostic'
+            and type(value.get('version')) is int and value['version'] == 1
+            and value.get('stage') in ('collector_identity_verification', 'receipt_history_verification')
+            and value.get('error') == 'The autonomous collector unexpectedly restarted.'
+            and 'PRIVATE KEY' not in lines[0] and '/Users/' not in lines[0]):
+        return value
+    return None
+
+
+def validate_injected_restart(diagnostic):
+    require(diagnostic and diagnostic['injected'] is True
+            and diagnostic['stage'] == 'collector_identity_verification',
+            'The intended archive collector restart was not detected.')
+    initial, current, first = (diagnostic[key] for key in ('initial', 'current', 'first_receipt'))
+    require(initial and current and initial['MainPID'] > 0 and current['MainPID'] > 0
+            and current['MainPID'] != initial['MainPID'] and initial['NRestarts'] == 0
+            and current['NRestarts'] == 1
+            and current['InvocationID'] != initial['InvocationID']
+            and current['ExecMainStartTimestampMonotonic'] > initial['ExecMainStartTimestampMonotonic'],
+            'Systemd did not report exactly one distinct collector replacement.')
+    require(first and first['cycle'] == 1 and first['committed_sequence'] == 2
+            and first['process_id'] == first['delivery_process_id'] == initial['MainPID'],
+            'The original collector did not durably complete the first observation.')
+    logs = diagnostic['bounded_unit_diagnostics'][COLLECTOR_UNIT]['recent_log']
+    require(any(re.fullmatch(r'Main process exited, code=killed, status=9/KILL\.?', line)
+                for line in logs.splitlines()), 'The diagnostic lacks the expected systemd exit signal.')
 
 
 def progress(message):
@@ -74,13 +120,17 @@ class DisposableVM(reboot.DisposableVM):
         self.ssh('sudo -n tar -xz --no-same-owner -f - -C ' + GUEST_ROOT,
                  input=extra_source_archive(), timeout=60)
 
-    def guest(self, stage):
-        require(stage in {'exercise', 'cleanup'}, 'Unknown archive guest stage.')
-        result = self.ssh('sudo -n python3 -I -S -B ' + GUEST_SCRIPT + ' ' + stage + ' --token ' + self.token,
+    def guest(self, stage, *, inject_collector_restart=False):
+        require(stage in {'exercise', 'cleanup'} and (not inject_collector_restart or stage == 'exercise'),
+                'Unknown archive guest stage or invalid restart injection.')
+        injection = ' --inject-collector-restart' if inject_collector_restart else ''
+        result = self.ssh('sudo -n python3 -I -S -B ' + GUEST_SCRIPT + ' ' + stage + ' --token ' + self.token + injection,
                           timeout=600 if stage == 'exercise' else 60, check=False)
         if result.returncode:
             error = (result.stderr or result.stdout).decode(errors='replace')[-12 * 1024:]
-            raise RuntimeError('A disposable archive guest operation failed: ' + self.redact(error).strip())
+            sanitized = self.redact(error).strip()
+            raise GuestStageFailed('A disposable archive guest operation failed: ' + sanitized,
+                                   read_restart_diagnostics(sanitized))
         require(len(result.stdout) <= 1024 * 1024, 'Guest stage metadata exceeds its bound.')
         value = json.loads(result.stdout)
         require(isinstance(value, dict) and value.get('ok') is True, 'The archive guest stage failed.')
@@ -94,6 +144,47 @@ class DisposableVM(reboot.DisposableVM):
     def export_guest(self):
         result = self.ssh('sudo -n tar -cz -C ' + GUEST_REPORT + ' -- ' + ' '.join(GUEST_FILES), timeout=60)
         return extract_guest_export(result.stdout)
+
+
+def reproduce_collector_restart(output):
+    tools, source = preflight(), source_identity()
+    destination = reboot.monitoring.base.new_output(output)
+    vm = DisposableVM(tools)
+    try:
+        virtualization = vm.prepare()
+        vm.launch()
+        virtualization['qmp_kvm'] = vm.kvm_status
+        before = vm.boot_snapshot()
+        progress('injecting a collector SIGKILL after its first durable receipt')
+        try:
+            vm.guest('exercise', inject_collector_restart=True)
+        except GuestStageFailed as error:
+            if error.diagnostics is None:
+                raise
+            diagnostic = error.diagnostics
+        else:
+            raise RuntimeError('The injected collector restart did not fail the archive exercise.')
+        validate_injected_restart(diagnostic)
+        validate_same_guest(before, vm.boot_snapshot())
+        guest_cleanup = vm.guest('cleanup')
+        require(guest_cleanup['ok'] is True and source_identity() == source,
+                'Guest cleanup or tested source verification failed.')
+    finally:
+        vm_cleanup = vm.cleanup()
+    require(vm_cleanup['ok'] is True, 'Disposable VM cleanup failed.')
+    report = {'format': 'heltemes-archive-collector-restart-reproduction', 'version': 1, 'ok': True,
+              'source': source, 'boot_id': before['boot_id'], 'virtualization': virtualization,
+              'image': {'url': reboot.IMAGE_URL, 'sha256': reboot.IMAGE_SHA256},
+              'diagnostic': diagnostic, 'guest_cleanup': guest_cleanup, 'vm_cleanup': vm_cleanup,
+              'scope': {'synthetic_only': True, 'signal_injected': 'SIGKILL',
+                        'natural_cause_identified': False, 'real_evidence_inputs': False, 'aws_deployed': False}}
+    path = destination / 'COLLECTOR-RESTART.json'
+    reboot.write_json(path, report)
+    reboot.write_json(destination / 'MANIFEST.json', {path.name: reboot.sha256_file(path)})
+    print(json.dumps({'ok': True, 'initial': diagnostic['initial'], 'replacement': diagnostic['current'],
+                      'first_receipt': diagnostic['first_receipt'], 'signal': '9/KILL',
+                      'guest_exercise_rejected_restart': True, 'cleanup': vm_cleanup}))
+    return {'ok': True, 'source': source, 'cleanup': vm_cleanup}
 
 
 def extract_guest_export(content):
@@ -349,6 +440,8 @@ def run(output):
         require(source_identity() == source, 'Archive monitoring source changed during the run.')
     except (OSError, ValueError, RuntimeError, KeyError, TypeError, subprocess.SubprocessError, tarfile.TarError) as error:
         report['error'] = step + ': ' + vm.redact(error).replace(str(destination), '<report>')
+        if isinstance(error, GuestStageFailed) and error.diagnostics is not None:
+            report['collector_restart'] = error.diagnostics
     finally:
         try:
             progress('stopping the owned VM and deleting private credentials and disk')
@@ -360,6 +453,11 @@ def run(output):
     report['cleanup'] = evidence['cleanup']
     reboot.write_json(staging / 'REPORT.json', report)
     if not report['ok']:
+        if 'collector_restart' in report:
+            reboot.write_json(destination / 'COLLECTOR-RESTART.json', {
+                'format': 'heltemes-archive-collector-restart-failure', 'version': 1, 'ok': False,
+                'source': source, 'diagnostic': report['collector_restart'], 'vm_cleanup': evidence['cleanup'],
+            })
         raise RuntimeError('Archive monitoring exercise failed: ' + report.get('error', 'Private VM cleanup failed.'))
     for name, content in files.items():
         (staging / name).write_bytes(content)
@@ -389,9 +487,11 @@ The guest services and synthetic network were cleaned up. The owned VM, private 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--output', required=True, help='New report directory with an existing parent')
+    parser.add_argument('--reproduce-collector-restart', action='store_true',
+                        help='Inject an owned collector SIGKILL and require the regular exercise to reject it')
     args = parser.parse_args()
     try:
-        result = run(args.output)
+        result = reproduce_collector_restart(args.output) if args.reproduce_collector_restart else run(args.output)
     except (OSError, ValueError, RuntimeError, KeyError, TypeError, subprocess.SubprocessError, tarfile.TarError) as error:
         parser.exit(1, 'Archive monitor VM stopped: ' + str(error) + '\n')
     print(json.dumps({'ok': result['ok'], 'source_commit': result['source']['commit'], 'cleanup': result['cleanup']}, indent=2))
