@@ -116,6 +116,25 @@ class FreshnessTests(unittest.TestCase):
         self.subject.tick()
         self.assertTrue(self.subject.status()["freshness"]["expired"])
 
+    def test_future_timestamp_is_accepted_only_after_clock_catches_up(self):
+        self.healthy()
+        payload = self.payload("clock-step")
+        payload["observation"]["observed_at_utc"] = (self.wall + timedelta(seconds=1)).isoformat()
+        original = store.encoded(payload)
+        before = self.subject.status()
+        with self.assertRaises(service.ObservationTimeRejected) as rejected:
+            self.subject.dispatch(payload)
+        self.assertEqual(rejected.exception.reason, "source_timestamp_in_future")
+        self.assertEqual(self.subject.status()["head_digest"], before["head_digest"])
+        self.assertEqual(self.subject.status()["freshness"]["last_accepted_at_utc"],
+                         before["freshness"]["last_accepted_at_utc"])
+
+        self.advance(1)
+        receipt = self.subject.dispatch(payload)
+        self.assertFalse(receipt["duplicate"])
+        self.assertEqual(receipt["committed_sequence"], before["committed_count"] + 1)
+        self.assertEqual(store.encoded(payload), original)
+
     def test_delayed_source_gets_only_remaining_source_freshness(self):
         self.observe("baseline")
         delayed = self.payload("delayed", monitor.CANARIES)

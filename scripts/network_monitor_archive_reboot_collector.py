@@ -169,20 +169,29 @@ class Collector:
             attempts += 1
             try:
                 result = service.request(self.state, pending['request'], timeout=3)
-                require(result.get('ok') is True, 'Archived-reboot observation was rejected; pending evidence is retained.')
-                require(type(result.get('duplicate')) is bool and type(result.get('committed_sequence')) is int,
-                        'Archived-reboot acknowledgement is incomplete.')
-                break
             except (OSError, ValueError) as error:
-                failures.append(type(error).__name__)
-                expired = time.monotonic() >= deadline
-                diagnostic = {'cycle': pending['cycle'], 'attempts': attempts, 'deadline_exceeded': expired,
-                              **transport_diagnostic(error)}
-                if attempts == 1 or expired:
-                    ordinary.replace_private(self.allocation.directory / 'transport.json', diagnostic)
-                require(not expired, 'Archived-reboot retry deadline exceeded; pending evidence is retained: '
-                        + store.encoded(diagnostic))
-                time.sleep(0.2)
+                retry = transport_diagnostic(error)
+                failures.append(retry['error_type'])
+            else:
+                if result.get('ok') is True:
+                    require(type(result.get('duplicate')) is bool and type(result.get('committed_sequence')) is int,
+                            'Archived-reboot acknowledgement is incomplete.')
+                    break
+                reason = result.get('reason')
+                require(result.get('ok') is False and result.get('error') == 'request_rejected'
+                        and isinstance(reason, str) and reason in service.RETRYABLE_REJECTIONS,
+                        'Archived-reboot observation was rejected; pending evidence is retained.')
+                # Retry the exact durable request. The monitor still checks freshness
+                # and will reject timestamps that remain invalid at delivery.
+                retry = {'error_type': 'request_rejected', 'errno': None, 'reason': reason}
+                failures.append(reason)
+            expired = time.monotonic() >= deadline
+            diagnostic = {'cycle': pending['cycle'], 'attempts': attempts, 'deadline_exceeded': expired, **retry}
+            if attempts == 1 or expired:
+                ordinary.replace_private(self.allocation.directory / 'transport.json', diagnostic)
+            require(not expired, 'Archived-reboot retry deadline exceeded; pending evidence is retained: '
+                    + store.encoded(diagnostic))
+            time.sleep(0.2)
         receipt = {**pending, 'committed_sequence': result['committed_sequence'], 'evaluation': result['evaluation'],
                    'duplicate_acknowledgement': result['duplicate'], 'delivery_attempts': attempts,
                    'transport_failures': failures, 'delivery_process_id': self.process_id, 'delivery_boot_id': self.boot_id,
@@ -211,8 +220,10 @@ class Collector:
         identity = {'instance_id': self.instance_id, 'process_id': self.process_id, 'boot_id': self.boot_id,
                     'phase': self.phase, 'stop_after_cycle': self.stop_after_cycle}
         while not self.stopping:
-            if time.monotonic() < due:
-                time.sleep(min(0.1, due - time.monotonic())); continue
+            remaining = due - time.monotonic()
+            if remaining > 0:
+                time.sleep(min(0.1, remaining))
+                continue
             ordinary.replace_private(self.allocation.directory / 'runtime.json', {
                 **identity, 'state': 'collecting', 'next_due_monotonic': due})
             receipt = self.collect()

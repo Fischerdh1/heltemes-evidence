@@ -22,6 +22,15 @@ CRASH_CODES = {"before_commit": 71, "after_commit_before_ack": 72}
 MAX_RESPONSE = 16 * 1024 * 1024
 IO_SECONDS = 3.0
 TICK_SECONDS = 0.2
+RETRYABLE_REJECTIONS = frozenset({"request_deadline", "source_timestamp_in_future"})
+
+
+class ObservationTimeRejected(ValueError):
+    """A fixed diagnostic for a rejected original observation timestamp."""
+
+    def __init__(self, reason, message):
+        super().__init__(message)
+        self.reason = reason
 
 
 def utc_now():
@@ -212,11 +221,16 @@ class Service:
             received = utc_now()
             received_monotonic = time.monotonic()
             source_age = store.monitor.utc(received) - source_time
-            store.require(0 <= source_age < self.freshness_seconds, "Source timestamp is stale or in the future.")
-            store.require(self.last_accepted is None or source_time > self.last_accepted["source_timestamp"],
-                          "Source timestamp does not advance the last accepted fresh observation.")
-            store.require(source_time >= store.monitor.utc(self._last_row()["sample"]["observed_at_utc"]),
-                          "Source timestamp precedes the latest committed observation boundary.")
+            if source_age < 0:
+                raise ObservationTimeRejected("source_timestamp_in_future", "Source timestamp is in the future.")
+            if source_age >= self.freshness_seconds:
+                raise ObservationTimeRejected("source_timestamp_stale", "Source timestamp is stale.")
+            if self.last_accepted is not None and source_time <= self.last_accepted["source_timestamp"]:
+                raise ObservationTimeRejected("source_timestamp_not_advancing",
+                    "Source timestamp does not advance the last accepted fresh observation.")
+            if source_time < store.monitor.utc(self._last_row()["sample"]["observed_at_utc"]):
+                raise ObservationTimeRejected("source_timestamp_before_boundary",
+                    "Source timestamp precedes the latest committed observation boundary.")
         def fault(current):
             if current == point:
                 os._exit(CRASH_CODES[current])
@@ -241,7 +255,7 @@ class Service:
 
 
 def serve(state, *, allow_test_crashes=False, test_pause=None, freshness_seconds=None,
-          archive_history=False, journal_factory=None):
+          archive_history=False, journal_factory=None, diagnose_rejections=False):
     path = socket_path(state)
     if journal_factory is None:
         if archive_history:
@@ -280,13 +294,31 @@ def serve(state, *, allow_test_crashes=False, test_pause=None, freshness_seconds
                     with connection:
                         connection.settimeout(IO_SECONDS)
                         deadline = time.monotonic() + IO_SECONDS if freshness_seconds is not None else None
+                        phase = "receive"
                         try:
-                            response = service.dispatch(receive(connection, store.MAX_REQUEST,
-                                deadline=deadline, tick=service.tick if deadline is not None else None))
+                            payload = receive(connection, store.MAX_REQUEST, deadline=deadline,
+                                              tick=service.tick if deadline is not None else None)
+                            phase = "dispatch"
+                            response = service.dispatch(payload)
+                            phase = "response"
                             data = (store.encoded(response) + "\n").encode()
                             store.require(len(data) <= MAX_RESPONSE, "Response exceeds size limit.")
-                        except (ValueError, TypeError, KeyError, OSError, OverflowError, store.sqlite3.Error):
+                        except (ValueError, TypeError, KeyError, OSError, OverflowError, store.sqlite3.Error) as error:
                             data = b'{"ok":false,"error":"request_rejected"}\n'
+                            if diagnose_rejections:
+                                # The disposable lab can distinguish transient delivery failures
+                                # without disclosing request bytes or exception text.
+                                if phase == "receive" and isinstance(error, TimeoutError):
+                                    reason = "request_deadline"
+                                elif isinstance(error, ObservationTimeRejected):
+                                    reason = error.reason
+                                elif isinstance(error, store.sqlite3.Error) or service.persistence_error:
+                                    reason = "journal_error"
+                                else:
+                                    reason = phase + "_rejected"
+                                print("Monitor request rejected: " + reason, file=sys.stderr, flush=True)
+                                data = (store.encoded({"ok": False, "error": "request_rejected",
+                                                       "reason": reason}) + "\n").encode()
                         try:
                             if deadline is not None:
                                 connection.settimeout(max(0.001, deadline - time.monotonic()))
