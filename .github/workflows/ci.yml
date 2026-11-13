@@ -1,7 +1,9 @@
 name: Verify project
 
 on:
+  # Feature branches run on pull_request; main is checked again after merge.
   push:
+    branches: [main]
   pull_request:
   workflow_dispatch:
 
@@ -232,10 +234,11 @@ jobs:
       - uses: actions/setup-python@e797f83bcb11b83ae66e0230d6156d7c80228e7c # v6.0.0
         with:
           python-version: '3.14'
-      - name: Install disposable guest VM tools
-        run: |
-          sudo apt-get update
-          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y qemu-system-x86 qemu-utils cloud-image-utils openssh-client curl
+      - name: Refresh disposable VM package index
+        run: sudo apt-get update
+      # Headless local-disk guests need dependencies, not GUI/extra-backend recommendations.
+      - name: Install required headless VM tools
+        run: sudo DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends qemu-system-x86 qemu-utils cloud-image-utils openssh-client curl
       - name: Exercise monitoring across a full guest reboot
         env:
           REVIEWER_PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
@@ -288,10 +291,11 @@ jobs:
       - uses: actions/setup-python@e797f83bcb11b83ae66e0230d6156d7c80228e7c # v6.0.0
         with:
           python-version: '3.14'
-      - name: Install disposable guest VM tools
-        run: |
-          sudo apt-get update
-          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y qemu-system-x86 qemu-utils cloud-image-utils openssh-client curl
+      - name: Refresh disposable VM package index
+        run: sudo apt-get update
+      # Headless local-disk guests need dependencies, not GUI/extra-backend recommendations.
+      - name: Install required headless VM tools
+        run: sudo DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends qemu-system-x86 qemu-utils cloud-image-utils openssh-client curl
       - name: Exercise abrupt virtual power loss and cold-start recovery
         env:
           REVIEWER_PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
@@ -345,10 +349,11 @@ jobs:
       - uses: actions/setup-python@e797f83bcb11b83ae66e0230d6156d7c80228e7c # v6.0.0
         with:
           python-version: '3.14'
-      - name: Install disposable guest VM tools
-        run: |
-          sudo apt-get update
-          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y qemu-system-x86 qemu-utils cloud-image-utils openssh-client curl
+      - name: Refresh disposable VM package index
+        run: sudo apt-get update
+      # Headless local-disk guests need dependencies, not GUI/extra-backend recommendations.
+      - name: Install required headless VM tools
+        run: sudo DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends qemu-system-x86 qemu-utils cloud-image-utils openssh-client curl
       - name: Exercise automatic collection and missing-data recovery
         env:
           REVIEWER_PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
@@ -395,10 +400,11 @@ jobs:
       - uses: actions/setup-python@e797f83bcb11b83ae66e0230d6156d7c80228e7c # v6.0.0
         with:
           python-version: '3.14'
-      - name: Install disposable guest VM tools
-        run: |
-          sudo apt-get update
-          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y qemu-system-x86 qemu-utils cloud-image-utils openssh-client curl
+      - name: Refresh disposable VM package index
+        run: sudo apt-get update
+      # Headless local-disk guests need dependencies, not GUI/extra-backend recommendations.
+      - name: Install required headless VM tools
+        run: sudo DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends qemu-system-x86 qemu-utils cloud-image-utils openssh-client curl
       - name: Exercise history archiving and crash recovery
         env:
           REVIEWER_PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
@@ -447,10 +453,11 @@ jobs:
       - uses: actions/setup-python@e797f83bcb11b83ae66e0230d6156d7c80228e7c # v6.0.0
         with:
           python-version: '3.14'
-      - name: Install disposable guest VM tools
-        run: |
-          sudo apt-get update
-          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y qemu-system-x86 qemu-utils cloud-image-utils openssh-client curl
+      - name: Refresh disposable VM package index
+        run: sudo apt-get update
+      # Headless local-disk guests need dependencies, not GUI/extra-backend recommendations.
+      - name: Install required headless VM tools
+        run: sudo DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends qemu-system-x86 qemu-utils cloud-image-utils openssh-client curl
       - name: Exercise archived history through a full guest reboot
         env:
           REVIEWER_PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
@@ -509,10 +516,11 @@ jobs:
       - uses: actions/setup-python@e797f83bcb11b83ae66e0230d6156d7c80228e7c # v6.0.0
         with:
           python-version: '3.14'
-      - name: Install disposable guest VM tools
-        run: |
-          sudo apt-get update
-          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y qemu-system-x86 qemu-utils cloud-image-utils openssh-client curl
+      - name: Refresh disposable VM package index
+        run: sudo apt-get update
+      # Headless local-disk guests need dependencies, not GUI/extra-backend recommendations.
+      - name: Install required headless VM tools
+        run: sudo DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends qemu-system-x86 qemu-utils cloud-image-utils openssh-client curl
       - name: Exercise archived history through abrupt guest power loss
         env:
           REVIEWER_PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
