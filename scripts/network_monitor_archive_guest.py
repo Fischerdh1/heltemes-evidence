@@ -6,6 +6,7 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import re
 import shutil
 import signal
 import stat
@@ -35,6 +36,21 @@ CAPTURE_FILES = reboot.CAPTURE_FILES
 ARCHIVE_FILES = ('archive-segment-000001.json', 'archive-segment-000002.json')
 PUBLIC_FILES = ('GUEST.json', 'APPROVED_POLICY.json', 'monitor.service', 'collector.service', *CAPTURE_FILES, *ARCHIVE_FILES)
 require, command, write_new = reboot.require, reboot.command, reboot.write_new
+COLLECTOR_RESTART = 'The autonomous collector unexpectedly restarted.'
+RESTART_DIAGNOSTIC_PREFIX = 'Archive collector restart diagnostics: '
+MAX_RESTART_DIAGNOSTIC = 8192
+IDENTITY_FIELDS = ('MainPID', 'NRestarts', 'ExecMainStartTimestampMonotonic', 'InvocationID')
+MONITOR_REJECTIONS = service.RETRYABLE_REJECTIONS | {
+    'source_timestamp_stale', 'source_timestamp_not_advancing', 'source_timestamp_before_boundary',
+    'journal_error', 'receive_rejected', 'dispatch_rejected', 'response_rejected',
+}
+
+
+class CollectorRestartError(RuntimeError):
+    def __init__(self, stage, *, current=None, first=None, differing=None):
+        super().__init__('Archive stage ' + stage + ' failed: ' + COLLECTOR_RESTART)
+        self.stage, self.current, self.first, self.differing = stage, current, first, differing
+        self.reported = False
 
 
 def unit_path(unit):
@@ -107,19 +123,72 @@ def request(name):
     return service.request(STATE, {'command': name}, timeout=10)
 
 
+def diagnostic_log(unit, text):
+    """Keep fixed manager events and lab error categories, with no arbitrary log text."""
+    patterns = (
+        r'Main process exited, code=(?:exited|killed|dumped), status=[0-9]{1,3}(?:/[A-Z0-9_]{1,32})?\.?',
+        r"Failed with result '(?:exit-code|signal|core-dump|timeout|watchdog|oom-kill|resources|protocol|start-limit-hit)'\.?",
+        r'Scheduled restart job, restart counter is at [0-9]{1,6}\.',
+        r'(?:Start request repeated too quickly|A process of this unit has been killed by the OOM killer)\.',
+    )
+    result = []
+    for line in text[-16384:].splitlines()[-24:]:
+        if line.startswith(unit + ': '):
+            message = line.removeprefix(unit + ': ')
+            if any(re.fullmatch(pattern, message) for pattern in patterns):
+                result.append(message)
+        elif unit == MONITOR_UNIT and line.startswith('Monitor request rejected: '):
+            if line.removeprefix('Monitor request rejected: ') in MONITOR_REJECTIONS:
+                result.append(line)
+        elif unit == COLLECTOR_UNIT and line.startswith('Disposable archive collector stopped: '):
+            message = line.removeprefix('Disposable archive collector stopped: ')
+            if message in {'Archive observation was rejected; pending evidence is retained.',
+                           'Archive acknowledgement is incomplete.', 'Archive collector allocation is invalid or exhausted.',
+                           'Unsafe archive allocation.', 'Unsafe pending archive observation.', 'Pending archive identity differs.',
+                           'Unsafe existing collector receipt.', 'Existing receipt differs from the committed observation.'}:
+                result.append(message)
+            else:
+                retry = re.fullmatch(r'Archive service retry deadline exceeded; pending evidence is retained: '
+                                     r'\{"attempts":([0-9]{1,4}),"cycle":([0-9]{1,4}),"errno":(-?[0-9]{1,6}|null),'
+                                     r'"error_type":"[A-Za-z0-9_]{1,64}","reason":"([a-z_]{1,32})"\}', message)
+                if retry and retry[4] in {'timeout', 'incomplete_response', 'multiple_frames', 'response_size_limit',
+                                          'socket_path_limit', 'socket_identity', 'request_size_limit', 'duplicate_json_key',
+                                          'nonfinite_json', 'os_error', 'invalid_response'}:
+                    result.append(f'Archive service retry deadline exceeded (cycle={retry[2]}, attempts={retry[1]}, '
+                                  f'errno={retry[3]}, reason={retry[4]}).')
+                else:
+                    result.append('Collector stopped with an unclassified error.')
+    return '\n'.join(result[-12:])
+
+
 def diagnostics():
-    """Read only two owned units, bounded fields and logs; never read environment or credentials."""
+    """Read bounded service properties and current-boot logs for the two owned units."""
     values = {}
-    fields = ('ActiveState', 'SubState', 'MainPID', 'NRestarts', 'ExecMainCode', 'ExecMainStatus', 'Result')
+    numeric_fields = ('MainPID', 'NRestarts', 'ExecMainCode', 'ExecMainStatus')
+    state_values = {
+        'ActiveState': {'active', 'reloading', 'inactive', 'failed', 'activating', 'deactivating', 'maintenance', 'refreshing'},
+        'SubState': {'running', 'dead', 'failed', 'auto-restart', 'auto-restart-queued', 'start', 'stop', 'stop-sigterm', 'stop-sigkill', 'exited'},
+        'Result': {'success', 'exit-code', 'signal', 'core-dump', 'timeout', 'watchdog', 'oom-kill', 'resources', 'protocol', 'start-limit-hit'},
+    }
+    fields = (*numeric_fields, *state_values)
     for unit in (MONITOR_UNIT, COLLECTOR_UNIT):
-        record = {}
+        record = {'service': {}, 'recent_log': ''}
         try:
             properties = command(['systemctl', 'show', '--no-pager', '--property=' + ','.join(fields), unit],
                                  check=False, timeout=5)
-            record['service'] = {key: automatic.sanitize_diagnostic(value) for line in properties.stdout.splitlines()
-                                 if '=' in line for key, value in [line.split('=', 1)] if key in fields}
-            logs = command(['journalctl', '--no-pager', '--output=cat', '--lines=12', '--unit=' + unit], check=False, timeout=5)
-            record['recent_log'] = automatic.sanitize_diagnostic(logs.stdout)
+            require(properties.returncode == 0, 'Service properties unavailable.')
+            for line in properties.stdout[:4096].splitlines():
+                key, _, value = line.partition('=')
+                if ((key in numeric_fields and re.fullmatch(r'[0-9]{1,20}', value))
+                        or value in state_values.get(key, ())):
+                    record['service'][key] = value
+        except (OSError, ValueError, RuntimeError, subprocess.SubprocessError):
+            record['diagnostic_unavailable'] = True
+        try:
+            logs = command(['journalctl', '--boot', '--no-pager', '--output=cat', '--lines=24', '--unit=' + unit],
+                           check=False, timeout=5)
+            require(logs.returncode == 0, 'Service journal unavailable.')
+            record['recent_log'] = diagnostic_log(unit, logs.stdout)
         except (OSError, ValueError, RuntimeError, subprocess.SubprocessError):
             record['diagnostic_unavailable'] = True
         values[unit] = record
@@ -143,7 +212,9 @@ def collector_diagnostic(request_id):
                 record['bytes'] = info.st_size
                 for key in ('process_id', 'cycle', 'cycles', 'next_port', 'committed_sequence'):
                     if key in value:
-                        record[key] = value[key] if type(value[key]) is int else None
+                        record[key] = bounded_int(value[key])
+                if name in ('runtime.json', 'pending.json'):
+                    record['instance_id_sha256'] = instance_digest(value.get('instance_id'))
                 if name == 'runtime.json':
                     record['state'] = value.get('state') if value.get('state') in ('collecting', 'idle') else 'unrecognized'
                 if name == 'pending.json':
@@ -156,6 +227,120 @@ def collector_diagnostic(request_id):
                 record['diagnostic_unavailable'] = True
         result[name] = record
     return result
+
+
+def bounded_int(value):
+    return value if type(value) is int and 0 <= value < 2**64 else None
+
+
+def is_invocation_id(value):
+    return isinstance(value, str) and re.fullmatch(r'[0-9a-f]{32}', value) is not None
+
+
+def instance_digest(value):
+    if is_invocation_id(value):
+        return hashlib.sha256(value.encode()).hexdigest()
+    return None
+
+
+def manager_identity(managed):
+    if not managed:
+        return None
+    invocation = managed.get('InvocationID')
+    return {**{key: bounded_int(managed.get(key)) for key in IDENTITY_FIELDS[:-1]},
+            'InvocationID': invocation if is_invocation_id(invocation) else ''}
+
+
+def receipt_identity(receipt):
+    return {**{key: bounded_int(receipt.get(key)) for key in ('cycle', 'committed_sequence', 'process_id', 'delivery_process_id')},
+            'instance_id_sha256': instance_digest(receipt.get('instance_id'))}
+
+
+class CollectorContinuity:
+    def __init__(self, *, inject):
+        self.initial = None
+        self.first = None
+        self.progress = None
+        self.inject = inject
+        self.injected = False
+        self.next_check = 0
+
+    def observe(self, status):
+        self.progress = {key: bounded_int(status.get(key)) for key in ('committed_count', 'process_id')}
+
+    def check(self, current=None, *, force=False):
+        if current is None:
+            if not force and time.monotonic() < self.next_check:
+                return
+            current = manager(COLLECTOR_UNIT)
+        self.next_check = time.monotonic() + 5
+        if self.initial is None:
+            self.initial = current
+            require(current['MainPID'] > 0 and current['ActiveState'] == 'active'
+                    and current['ExecMainStartTimestampMonotonic'] > 0
+                    and is_invocation_id(current['InvocationID']) and current['InvocationID'] != '0' * 32,
+                    'Initial archive collector identity is unavailable.')
+        # At the final healthy canary the original collector may exit successfully on its own.
+        # Explicit stop can clear NRestarts, so receipts also prove continuity after that stop.
+        changed = (current['NRestarts'] != 0 or current['ActiveState'] == 'failed'
+                   or current['SubState'] in {'auto-restart', 'auto-restart-queued'}
+                   or (current['MainPID'] > 0 and any(current[key] != self.initial[key] for key in IDENTITY_FIELDS)))
+        if changed:
+            raise CollectorRestartError('collector_identity_verification', current=current)
+
+    def report(self, error):
+        # Evidence collection cannot replace the specific failure or prevent teardown.
+        def available(action):
+            try:
+                return action()
+            except (OSError, ValueError, RuntimeError, KeyError, TypeError, subprocess.SubprocessError):
+                return None
+
+        first = self.first or error.first or available(lambda: receipt_identity(read_receipt(PRIVATE / 'receipt-0002.json')))
+        current = error.current or available(lambda: manager(COLLECTOR_UNIT))
+        value = {
+            'format': 'heltemes-archive-collector-restart-diagnostic', 'version': 1,
+            'stage': error.stage, 'error': COLLECTOR_RESTART, 'injected': self.injected,
+            'initial': manager_identity(self.initial), 'current': manager_identity(current),
+            'first_receipt': first, 'differing_receipt': error.differing,
+            'last_monitor_status': self.progress,
+            'collector_state': available(lambda: collector_diagnostic('')),
+            'bounded_unit_diagnostics': available(diagnostics),
+        }
+        line = RESTART_DIAGNOSTIC_PREFIX + store.encoded(value)
+        require(len(line.encode('ascii')) <= MAX_RESTART_DIAGNOSTIC, 'Restart diagnostics exceed their bound.')
+        print(line, file=sys.stderr, flush=True)
+
+    def reproduce(self):
+        """Kill the exact disposable unit after the original collector finishes its first commit."""
+        require(self.inject, 'Collector restart injection requires the explicit exercise flag.')
+        deadline = time.monotonic() + 45
+        while time.monotonic() < deadline:
+            self.check()
+            runtime = collector_diagnostic('')['runtime.json']
+            if runtime.get('state') == 'idle' and (runtime.get('cycle') or 0) >= 1:
+                self.first = receipt_identity(read_receipt(PRIVATE / 'receipt-0002.json'))
+                break
+            time.sleep(0.1)
+        require(self.first and self.first['cycle'] == 1 and self.first['committed_sequence'] == 2
+                and self.first['process_id'] == self.first['delivery_process_id'] == self.initial['MainPID']
+                and self.first['instance_id_sha256'], 'First committed receipt did not come from the original collector.')
+        status = request('status')
+        self.observe(status)
+        require(status.get('ok') is True and status['committed_count'] >= 2,
+                'Monitor did not confirm the first committed observation.')
+        self.check(force=True)
+        command(['systemctl', 'kill', '--kill-who=main', '--signal=KILL', COLLECTOR_UNIT])
+        self.injected = True
+        deadline = time.monotonic() + 20
+        while time.monotonic() < deadline:
+            current = manager(COLLECTOR_UNIT)
+            if current['ActiveState'] == 'active' and current['MainPID'] > 0 and current['MainPID'] != self.initial['MainPID']:
+                # Exercise the same rejection used for ordinary collector continuity.
+                self.check(current)
+            time.sleep(0.1)
+        self.check(force=True)
+        raise RuntimeError('Injected archive collector replacement was not observed.')
 
 
 def validate_recovery(before, marker, managed, recovered, after, incident, recovery_elapsed_seconds=None):
@@ -192,13 +377,18 @@ def validate_recovery(before, marker, managed, recovered, after, incident, recov
     raise RuntimeError('Supervisor recovery or incident continuity differs: ' + json.dumps(evidence, sort_keys=True))
 
 
-def wait_status(predicate, timeout=45):
+def wait_status(predicate, timeout=45, *, continuity=None):
     deadline, last = time.monotonic() + timeout, None
     while time.monotonic() < deadline:
+        if continuity is not None:
+            continuity.check()
         try:
             last = request('status')
-            if last.get('ok') is True and predicate(last):
-                return last
+            if last.get('ok') is True:
+                if continuity is not None:
+                    continuity.observe(last)
+                if predicate(last):
+                    return last
         except (OSError, ValueError):
             pass
         time.sleep(0.1)
@@ -262,7 +452,8 @@ def worker():
     require(reboot.MARKER.stat().st_size < 4096, 'Oversized marker.')
     guard(store.parse(reboot.MARKER.read_bytes())['token'])
     # Injection is confined to this explicit disposable guest entry point.
-    service.serve(STATE, freshness_seconds=FRESHNESS, archive_history=True, journal_factory=ExerciseJournal)
+    service.serve(STATE, freshness_seconds=FRESHNESS, archive_history=True, journal_factory=ExerciseJournal,
+                  diagnose_rejections=True)
 
 
 def install(approved, names):
@@ -284,12 +475,14 @@ def stopped(pid):
                  if line.startswith('State:')), None) == 'T'
 
 
-def crash_rollover(point, number, started, incident):
+def crash_rollover(point, number, started, incident, continuity):
     before = snapshot(started)
+    continuity.check(before['collector_manager'])
     require(reboot.critical(before['status'])['id'] == incident, 'Critical incident changed before archiving.')
     write_new(ARM, {'point': point, 'head_sequence': SEGMENT_ROWS * number})
     deadline, marker = time.monotonic() + 160, None
     while time.monotonic() < deadline:
+        continuity.check()
         if BOUNDARY.exists():
             reboot.ordinary(BOUNDARY)
             require(BOUNDARY.stat().st_size < 1024 * 1024, 'Oversized boundary record.')
@@ -313,8 +506,10 @@ def crash_rollover(point, number, started, incident):
     ARM.unlink(); store.sync_directory(RUNTIME)
     recovery_started = time.monotonic()
     command(['systemctl', 'kill', '--kill-who=main', '--signal=KILL', MONITOR_UNIT])
-    recovered = wait_status(lambda s: s['process_id'] != marker['process_id'] and s['committed_count'] > marker['head_sequence'])
+    recovered = wait_status(lambda s: s['process_id'] != marker['process_id'] and s['committed_count'] > marker['head_sequence'],
+                            continuity=continuity)
     after = snapshot(started)
+    continuity.check(after['collector_manager'])
     recovery_elapsed = time.monotonic() - recovery_started
     validate_recovery(before, marker, managed, recovered, after, incident, recovery_elapsed)
     BOUNDARY.unlink(); store.sync_directory(RUNTIME)
@@ -339,8 +534,14 @@ def receipts():
 def validate_inventory(journal, records, crashes):
     rows = {r['request_id']: r for r in journal['rows'] if r['request']['kind'] == 'observation'}
     require(len(rows) == len(records), 'Every committed observation must have one autonomous receipt.')
-    require(len({r['instance_id'] for r in records}) == len({r['process_id'] for r in records}) == 1,
-            'The autonomous collector unexpectedly restarted.')
+    if not records:
+        raise CollectorRestartError('receipt_history_verification')
+    first = records[0]
+    for record in records:
+        if (record['instance_id'] != first['instance_id'] or record['process_id'] != first['process_id']
+                or record.get('delivery_process_id', record['process_id']) != first['process_id']):
+            raise CollectorRestartError('receipt_history_verification', first=receipt_identity(first),
+                                        differing=receipt_identity(record))
     require([r['cycle'] for r in records] == list(range(1, len(records) + 1)), 'Collector cycle sequence has gaps.')
     probes, ports = [], set()
     for record in records:
@@ -417,6 +618,8 @@ def stage_call(name, action):
             'Unknown archive completion stage.')
     try:
         return action()
+    except CollectorRestartError:
+        raise
     except (OSError, ValueError, RuntimeError, KeyError, TypeError, subprocess.SubprocessError) as error:
         raise RuntimeError('Archive stage ' + name + ' failed: ' + str(error)) from error
 
@@ -451,25 +654,33 @@ def retry_and_stop(first):
     return journal, final, duplicate, stopped_manager
 
 
-def run_exercise(lab):
+def run_exercise(lab, continuity):
     started = time.monotonic()
     lab.setup(); lab.start_services(); lab.apply_policy()
     approved = lab.ruleset()
     lab.start_captures(); install(approved, lab.names)
     stages = {'initial': snapshot(started)}
     command(['systemctl', 'start', COLLECTOR_UNIT])
-    wait_status(lambda s: s['current_evaluation']['status'] == 'healthy')
+    continuity.check(force=True)
+    if continuity.inject:
+        continuity.reproduce()
+    wait_status(lambda s: s['current_evaluation']['status'] == 'healthy', continuity=continuity)
     stages['baseline'] = snapshot(started)
+    continuity.check(stages['baseline']['collector_manager'])
     lab.apply_policy('misconfigured')
-    detected = wait_status(lambda s: any(a['key'] == reboot.CRITICAL and a['state'] == 'open' for a in s['alerts']), timeout=40)
+    detected = wait_status(lambda s: any(a['key'] == reboot.CRITICAL and a['state'] == 'open' for a in s['alerts']),
+                           timeout=40, continuity=continuity)
     incident = reboot.critical(detected)['id']
     stages['incident'] = snapshot(started)
-    crashes = [crash_rollover(point, index, started, incident) for index, point in enumerate(POINTS, 1)]
-    wait_status(lambda s: s['committed_count'] >= MIN_OBSERVATIONS + 3, timeout=50)
+    continuity.check(stages['incident']['collector_manager'])
+    crashes = [crash_rollover(point, index, started, incident, continuity) for index, point in enumerate(POINTS, 1)]
+    wait_status(lambda s: s['committed_count'] >= MIN_OBSERVATIONS + 3, timeout=50, continuity=continuity)
     stages['beyond_legacy_limit'] = snapshot(started)
+    continuity.check(stages['beyond_legacy_limit']['collector_manager'])
     require(reboot.critical(stages['beyond_legacy_limit']['status'])['id'] == incident, 'Archiving cleared the unresolved incident.')
     lab.apply_policy()
-    wait_status(lambda s: s['current_evaluation']['status'] == 'healthy', timeout=40)
+    wait_status(lambda s: s['current_evaluation']['status'] == 'healthy', timeout=40, continuity=continuity)
+    continuity.check(force=True)
     command(['systemctl', 'stop', COLLECTOR_UNIT], timeout=30)
     stages['recovered'] = snapshot(started)
     require(stages['recovered']['status']['current_evaluation']['status'] == 'healthy', 'Fresh canary recovery was not preserved at stop.')
@@ -515,7 +726,7 @@ def storage_info():
     return record
 
 
-def exercise(token):
+def exercise(token, *, inject_collector_restart=False):
     virtualization = guard(token)
     require(not DATA.exists() and not RUNTIME.exists() and not any(unit_path(u).exists() for u in (MONITOR_UNIT, COLLECTOR_UNIT)),
             'Existing archive installation cannot be reset.')
@@ -524,15 +735,33 @@ def exercise(token):
     store.sync_directory(DATA.parent)
     boot, hashes = reboot.boot_info(virtualization), source_hashes()
     lab = automatic.monitoring.MonitoringLab(reboot.base.preflight(), staging)
+    continuity = CollectorContinuity(inject=inject_collector_restart)
+    failed = False
     try:
-        outcome = run_exercise(lab)
+        outcome = run_exercise(lab, continuity)
+    except BaseException as error:
+        failed = True
+        if isinstance(error, CollectorRestartError):
+            try:
+                print('Disposable archive guest stopped: ' + str(error), file=sys.stderr, flush=True)
+                error.reported = True
+                continuity.report(error)
+            except (OSError, ValueError, RuntimeError, KeyError, TypeError, subprocess.SubprocessError):
+                pass
+        raise
     finally:
-        for unit in (COLLECTOR_UNIT, MONITOR_UNIT):
-            if unit_path(unit).exists():
-                command(['systemctl', 'kill', '--kill-who=main', '--signal=CONT', unit], check=False)
-                command(['systemctl', 'stop', unit], check=False, timeout=30)
-        cleaned = lab.cleanup()
-        require(cleaned['ok'], 'Owned network cleanup failed.')
+        try:
+            try:
+                for unit in (COLLECTOR_UNIT, MONITOR_UNIT):
+                    if unit_path(unit).exists():
+                        command(['systemctl', 'kill', '--kill-who=main', '--signal=CONT', unit], check=False)
+                        command(['systemctl', 'stop', unit], check=False, timeout=30)
+            finally:
+                cleaned = lab.cleanup()
+                require(cleaned['ok'], 'Owned network cleanup failed.')
+        except (OSError, ValueError, RuntimeError, KeyError, TypeError, subprocess.SubprocessError):
+            if not failed:
+                raise
     capture_hashes = {}
     for name in CAPTURE_FILES:
         capture_hashes[name] = automatic.seal_capture(staging / name)
@@ -581,12 +810,18 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('stage', choices=('worker', 'exercise', 'cleanup'))
     parser.add_argument('--token')
+    parser.add_argument('--inject-collector-restart', action='store_true', help='Inject one restart in the guarded exercise.')
     args = parser.parse_args()
+    if args.inject_collector_restart and args.stage != 'exercise':
+        parser.error('Collector restart injection is only available in the disposable exercise.')
     try:
         if args.stage == 'worker':
             require(args.token is None, 'Worker reads only its root-owned marker.')
             worker(); return
-        result = cleanup(args.token) if args.stage == 'cleanup' else exercise(args.token)
+        result = (cleanup(args.token) if args.stage == 'cleanup'
+                  else exercise(args.token, inject_collector_restart=args.inject_collector_restart))
+    except CollectorRestartError as error:
+        parser.exit(1, None if error.reported else 'Disposable archive guest stopped: ' + str(error) + '\n')
     except (OSError, ValueError, RuntimeError, KeyError, TypeError, subprocess.SubprocessError) as error:
         parser.exit(1, 'Disposable archive guest stopped: ' + str(error) + '\n')
     print(json.dumps(result, sort_keys=True))

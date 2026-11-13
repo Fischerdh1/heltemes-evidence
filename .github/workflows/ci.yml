@@ -411,6 +411,14 @@ jobs:
         run: |
           mkdir -p work
           python3 -I -S -B scripts/network_monitor_archive_vm.py --output work/monitor-archive
+      - name: Retain archive collector restart diagnostics on failure
+        if: ${{ failure() }}
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: monitor-archive-restart-diagnostic-${{ github.sha }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: work/monitor-archive/COLLECTOR-RESTART.json
+          if-no-files-found: ignore
+          retention-days: 30
       - name: Retain archived monitoring evidence
         id: archive_evidence
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
