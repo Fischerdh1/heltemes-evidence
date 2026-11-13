@@ -47,6 +47,15 @@ All archives remain bounded by row, byte, segment, and probe budgets. This test 
 
 The separate [archive power-loss exercise](NETWORK_MONITOR_ARCHIVE_POWERCUT.md) targets three archive handoff boundaries with abrupt whole-VM termination and cold starts.
 
+## Retry checks in CI
+
+The separate `monitor_archive_retry` job starts a disposable guest with a new archive journal and a synthetic firewall ruleset. It exercises the archive reboot collector and monitor over a real Unix socket.
+
+1. Send a request without its terminating newline. The monitor logs `request_deadline` after the three-second receive deadline.
+2. Send an observation whose original UTC timestamp is about two seconds ahead. The monitor logs `source_timestamp_in_future`. The drill holds delivery until the same timestamp becomes eligible.
+
+For each case, CI checks that rejection leaves the journal head unchanged and the saved request keeps the same bytes. The retry adds one row. A third delivery returns the original sequence with `duplicate: true` and leaves the head unchanged. The job publishes `DRILL.json`, a source and run report, VM cleanup evidence, and a SHA-256 manifest. The reviewer gate requires this job to pass.
+
 ## Interview explanation
 
 “I tested an archived monitoring journal through a full Linux VM reboot. I held the original archive bytes outside the guest, verified that the same disk reopened under a new kernel boot, and checked that automatic startup preserved the unresolved incident while reporting unknown coverage. Fresh network checks were required before recovery. Collection then continued into a third archive segment with the original global history and port allocation intact. The test uses a disposable synthetic network and explicit network reconstruction.”
