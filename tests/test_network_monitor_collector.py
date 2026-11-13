@@ -152,5 +152,51 @@ class CollectorTests(unittest.TestCase):
         self.assertEqual(runtime['process_id'], os.getpid())
 
 
+    def test_run_deadline_crossing_and_missed_slots_preserve_cadence(self):
+        allocation = self.allocation()
+        interval = collector.INTERVAL
+        due = 10.0 + interval
+        late = 10.0 + 3.25 * interval
+        scenarios = [
+            ('crossed_deadline', [10.0, 10.0, 10.0, due - 0.05, due + 0.05, due + 0.05],
+             [0.05], due, due + interval),
+            ('exact_deadline', [10.0, 10.0, 10.0, due, due], [], due, due + interval),
+            ('capped_wait', [10.0, 10.0, 10.0, due - 0.5, due, due],
+             [0.1], due, due + interval),
+            ('missed_slots', [10.0, 10.0, late, late, late, late, 10.0 + 4 * interval,
+                              10.0 + 4 * interval], [], 10.0 + 4 * interval, 10.0 + 5 * interval),
+        ]
+        for name, clock, expected_sleeps, second_due, next_due in scenarios:
+            with self.subTest(name=name):
+                worker = collector.Collector(Mock(), allocation)
+                collection_dues, sleeps = [], []
+                def collect_then_stop():
+                    runtime = json.loads((self.directory / 'runtime.json').read_text())
+                    collection_dues.append(runtime['next_due_monotonic'])
+                    if len(collection_dues) == 2:
+                        worker.stop()
+                    return {'committed_sequence': len(collection_dues) + 1, 'cycle': len(collection_dues),
+                            'completed_at_utc': 'timestamp', 'evaluation': {'status': 'healthy'}}
+                def checked_sleep(duration):
+                    # A plain sleep mock would hide the original negative-duration exception.
+                    if duration < 0:
+                        raise ValueError('sleep length must be non-negative')
+                    self.assertGreater(duration, 0)
+                    self.assertLessEqual(duration, 0.1)
+                    sleeps.append(duration)
+                with patch.object(worker, 'collect', side_effect=collect_then_stop), \
+                     patch.object(collector.time, 'monotonic', side_effect=clock), \
+                     patch.object(collector.time, 'sleep', side_effect=checked_sleep):
+                    worker.run()
+                self.assertEqual(collection_dues, [10.0, second_due])
+                self.assertEqual(len(sleeps), len(expected_sleeps))
+                for actual, expected in zip(sleeps, expected_sleeps):
+                    self.assertAlmostEqual(actual, expected)
+                runtime = json.loads((self.directory / 'runtime.json').read_text())
+                self.assertEqual(runtime['state'], 'idle')
+                self.assertEqual(runtime['next_due_monotonic'], next_due)
+                self.assertEqual(runtime['committed_sequence'], 3)
+
+
 if __name__ == '__main__':
     unittest.main()

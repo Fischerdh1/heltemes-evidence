@@ -741,7 +741,7 @@ def worker():
     reboot.ordinary(reboot.MARKER)
     require(reboot.MARKER.stat().st_size < 4096, 'Oversized disposable marker.')
     guard(store.parse(reboot.MARKER.read_bytes())['token'])
-    service.serve(STATE, freshness_seconds=FRESHNESS, archive_history=True)
+    service.serve(STATE, freshness_seconds=FRESHNESS, archive_history=True, diagnose_rejections=True)
 
 
 def cleanup(token):

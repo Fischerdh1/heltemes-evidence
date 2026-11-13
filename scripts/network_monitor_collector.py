@@ -163,8 +163,9 @@ class Collector:
     def run(self):
         due = time.monotonic()
         while not self.stopping:
-            if time.monotonic() < due:
-                time.sleep(min(0.1, due - time.monotonic()))
+            remaining = due - time.monotonic()
+            if remaining > 0:
+                time.sleep(min(0.1, remaining))
                 continue
             replace_private(self.allocation.directory / 'runtime.json', {
                 'instance_id': self.instance_id, 'process_id': self.process_id, 'state': 'collecting', 'next_due_monotonic': due})
