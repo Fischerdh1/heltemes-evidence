@@ -580,6 +580,29 @@ jobs:
           cat work/monitor-archive-powercut/publish/SUMMARY.md >> "$GITHUB_STEP_SUMMARY"
           printf '\n[Download archive power-loss evidence](%s)\n' "$ARTIFACT_URL" >> "$GITHUB_STEP_SUMMARY"
 
+  key_rotation_restore:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
+        with:
+          persist-credentials: false
+      - name: Restore synthetic evidence across a signing-key change
+        env:
+          REVIEWER_PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          mkdir -p work
+          python3 -I -S -B scripts/key_rotation_restore_drill.py --output work/key-rotation-restore
+      - name: Retain verified key rotation restore report
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: key-rotation-restore-${{ github.sha }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            work/key-rotation-restore/REPORT.json
+            work/key-rotation-restore/MANIFEST.json
+          if-no-files-found: error
+          retention-days: 30
+
   clean_restore:
     needs: [python]
     runs-on: ubuntu-24.04
@@ -650,7 +673,7 @@ jobs:
 
   reviewer:
     if: ${{ always() }}
-    needs: [python, terraform, network_lab, monitor_reboot, monitor_powercut, monitor_automatic, monitor_archive, monitor_archive_reboot, monitor_archive_powercut, monitor_archive_retry, clean_restore]
+    needs: [python, terraform, network_lab, monitor_reboot, monitor_powercut, monitor_automatic, monitor_archive, monitor_archive_reboot, monitor_archive_powercut, monitor_archive_retry, clean_restore, key_rotation_restore]
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
@@ -664,10 +687,10 @@ jobs:
           expected = {
               'python', 'terraform', 'network_lab', 'monitor_reboot', 'monitor_powercut', 'monitor_automatic',
               'monitor_archive', 'monitor_archive_reboot', 'monitor_archive_powercut', 'monitor_archive_retry',
-              'clean_restore',
+              'clean_restore', 'key_rotation_restore',
           }
           if set(results) != expected or any(value.get('result') != 'success' for value in results.values()):
-              raise SystemExit('Reviewer blocked: every prerequisite, including VM reboot, abrupt virtual power loss, automatic missing-data recovery, history archiving, archived-history full reboot, archived-history abrupt power loss, archive reboot collector retries, and synthetic clean-machine restore, must succeed.')
+              raise SystemExit('Reviewer blocked: every prerequisite, including VM reboot, abrupt virtual power loss, automatic missing-data recovery, history archiving, archived-history full reboot, archived-history abrupt power loss, archive reboot collector retries, synthetic clean-machine restore, and signing-key rotation restore, must succeed.')
           PY
       - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
         with:

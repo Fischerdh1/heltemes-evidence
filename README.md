@@ -16,6 +16,8 @@ A local-first SEC evidence workspace with a Python collector, preserved source d
 
 **Clean-machine recovery:** the [restore drill](docs/CLEAN_MACHINE_RESTORE.md) transfers synthetic backups and separately retained public receipts to a fresh disposable Ubuntu guest. The `clean_restore` job checks valid restores, rejects an altered filing and rollback, and confirms that a public-only restore cannot sign pending evidence.
 
+**Recovery after a signing-key change:** the [local restore drill](docs/KEY_ROTATION_RESTORE_DRILL.md) simulates a lost practice key, preserves its signed history across an authorized replacement, and tests matching and mismatched backup/receipt pairs from both sides of the change.
+
 **Network-security case study:** the [isolated Linux network lab](docs/NETWORK_LAB.md) exercises a client, router, and synthetic server in separate network namespaces on a disposable GitHub runner. Its checks cover permitted traffic, a firewall drop with a healthy destination, a detected policy mistake, repair, and cleanup. Successful runs retain the packet capture, rules, observations, and file manifest for 30 days.
 
 **DNS and TLS diagnosis:** the [service-layer expansion](docs/NETWORK_SERVICES_LAB.md) distinguishes an unknown DNS name, a blocked TCP connection, an incorrect certificate hostname, and an untrusted certificate issuer. It verifies a successful HTTPS request before and after the failure exercises, records packet evidence, and removes its temporary certificate keys before publishing results.

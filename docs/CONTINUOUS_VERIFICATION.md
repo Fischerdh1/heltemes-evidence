@@ -18,7 +18,9 @@ The separate `monitor_archive_powercut` job kills the entire disposable VM at th
 
 The `monitor_archive_retry` job verifies both retryable rejections through a Unix socket in a disposable guest. It checks that the same saved request commits once and a duplicate replay leaves the journal unchanged. [Retry checks](NETWORK_MONITOR_ARCHIVE_REBOOT.md#retry-checks-in-ci)
 
-The `clean_restore` job runs six synthetic backup and signing checks on a fresh Ubuntu guest. It requires a matching public receipt for protected restore, rejects rollback and signed-record tampering, and confirms public-only recovery. Inspect `CLEAN-RESTORE.json` and `MANIFEST.json` in `clean-machine-restore-<commit>-<run ID>-<attempt>`. Reviewer packaging requires both jobs to succeed. [Clean-machine restore](CLEAN_MACHINE_RESTORE.md)
+The `clean_restore` job runs six synthetic backup and signing checks on a fresh Ubuntu guest. It requires a matching public receipt for protected restore, rejects rollback and signed-record tampering, and confirms public-only recovery. Inspect `CLEAN-RESTORE.json` and `MANIFEST.json` in `clean-machine-restore-<commit>-<run ID>-<attempt>`. The reviewer guard requires this job to succeed. [Clean-machine restore](CLEAN_MACHINE_RESTORE.md)
+
+The `key_rotation_restore` job runs the five-case [key rotation restore drill](KEY_ROTATION_RESTORE_DRILL.md) on the standard Linux runner. It checks both matching backup and receipt pairs, rejects both cross-key mismatches, and blocks signing from a public-only restore. Reviewer packaging requires this job to succeed. The `key-rotation-restore-<commit>-<run ID>-<attempt>` artifact retains only `REPORT.json` and `MANIFEST.json` for 30 days. The report identifies the tested commit and, on pull requests, the proposed branch head separately.
 
 ## Inspect a run
 
