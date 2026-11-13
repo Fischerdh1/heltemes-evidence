@@ -580,6 +580,34 @@ jobs:
           cat work/monitor-archive-powercut/publish/SUMMARY.md >> "$GITHUB_STEP_SUMMARY"
           printf '\n[Download archive power-loss evidence](%s)\n' "$ARTIFACT_URL" >> "$GITHUB_STEP_SUMMARY"
 
+  clean_restore:
+    needs: [python]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 18
+    steps:
+      - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
+        with:
+          persist-credentials: false
+      - name: Install headless VM tools
+        run: |
+          sudo apt-get update
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends qemu-system-x86 qemu-utils cloud-image-utils openssh-client curl
+      - name: Restore synthetic evidence on a fresh guest
+        env:
+          REVIEWER_PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          mkdir -p work
+          python3 -I -S -B scripts/clean_restore_vm.py --output work/clean-machine-restore
+      - name: Retain verified restore report
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: clean-machine-restore-${{ github.sha }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            work/clean-machine-restore/CLEAN-RESTORE.json
+            work/clean-machine-restore/MANIFEST.json
+          if-no-files-found: error
+          retention-days: 30
+
   monitor_archive_retry:
     needs: [python]
     runs-on: ubuntu-24.04
@@ -622,7 +650,7 @@ jobs:
 
   reviewer:
     if: ${{ always() }}
-    needs: [python, terraform, network_lab, monitor_reboot, monitor_powercut, monitor_automatic, monitor_archive, monitor_archive_reboot, monitor_archive_powercut, monitor_archive_retry]
+    needs: [python, terraform, network_lab, monitor_reboot, monitor_powercut, monitor_automatic, monitor_archive, monitor_archive_reboot, monitor_archive_powercut, monitor_archive_retry, clean_restore]
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
@@ -636,9 +664,10 @@ jobs:
           expected = {
               'python', 'terraform', 'network_lab', 'monitor_reboot', 'monitor_powercut', 'monitor_automatic',
               'monitor_archive', 'monitor_archive_reboot', 'monitor_archive_powercut', 'monitor_archive_retry',
+              'clean_restore',
           }
           if set(results) != expected or any(value.get('result') != 'success' for value in results.values()):
-              raise SystemExit('Reviewer blocked: every prerequisite, including VM reboot, abrupt virtual power loss, automatic missing-data recovery, history archiving, archived-history full reboot, archived-history abrupt power loss, and archive reboot collector retries, must succeed.')
+              raise SystemExit('Reviewer blocked: every prerequisite, including VM reboot, abrupt virtual power loss, automatic missing-data recovery, history archiving, archived-history full reboot, archived-history abrupt power loss, archive reboot collector retries, and synthetic clean-machine restore, must succeed.')
           PY
       - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
         with:

@@ -1,6 +1,6 @@
 # Reviewable evidence for each change
 
-The `reviewer` job in `Verify project` runs after both Python test jobs, Terraform validation, the isolated Linux network lab, the full guest-reboot exercise, the abrupt virtual-power-loss exercise, the automatic missing-data recovery exercise, the history archive exercise, the archived-history full-reboot exercise, and the archived-history abrupt-power-loss exercise succeed. It creates a fresh synthetic archive, runs the existing 12-phase demonstration, packages the source and results, and retains a downloadable artifact for 30 days. A new run has its own identifiers and timestamps. The network lab retains its own packet capture and policy observations. See [the network lab guide](NETWORK_LAB.md) for that separate report.
+The `reviewer` job in `Verify project` runs after both Python test jobs, Terraform validation, and all network and recovery jobs described below succeed. It creates a fresh synthetic archive, runs the existing 12-phase demonstration, packages the source and results, and retains a downloadable artifact for 30 days. A new run has its own identifiers and timestamps. The network lab retains its own packet capture and policy observations. See [the network lab guide](NETWORK_LAB.md) for that separate report.
 
 The required `network_lab` job runs the routing/firewall exercise, the [DNS/TLS exercise](NETWORK_SERVICES_LAB.md), the [segmentation exercise](NETWORK_SEGMENTATION.md), the [monitoring exercise](NETWORK_MONITORING.md), and the [service-restart exercise](NETWORK_MONITOR_RESTART.md). Each has a separate artifact. A successful earlier exercise does not establish that the entire job passed; verify all five results and the final job status. DNS/TLS uploads exclude temporary private keys. All five artifacts use the same 30-day retention period.
 
@@ -15,6 +15,10 @@ The separate `monitor_archive` job extends the journal with two replay-verified 
 The separate `monitor_archive_reboot` job tests the archived format through a full guest OS reboot. Its [archive reboot guide](NETWORK_MONITOR_ARCHIVE_REBOOT.md) covers host-held preboot references, unchanged segments and history prefix, automatic unknown startup, explicit reconstruction of the disposable network, and a third rollover after fresh recovery. Its tenth network artifact is required by the explicit reviewer guard.
 
 The separate `monitor_archive_powercut` job kills the entire disposable VM at three archive handoff boundaries, then cold-starts the retained disk after each. The [archive power-loss guide](NETWORK_MONITOR_ARCHIVE_POWERCUT.md) explains interrupted staging, file publication, committed metadata, exact retries, and fresh network recovery. Its eleventh network artifact binds host-held references to the recovered history. The explicit reviewer guard requires this job as well. These are bounded submitted observations; continuous collection is exercised separately.
+
+The `monitor_archive_retry` job verifies both retryable rejections through a Unix socket in a disposable guest. It checks that the same saved request commits once and a duplicate replay leaves the journal unchanged. [Retry checks](NETWORK_MONITOR_ARCHIVE_REBOOT.md#retry-checks-in-ci)
+
+The `clean_restore` job runs six synthetic backup and signing checks on a fresh Ubuntu guest. It requires a matching public receipt for protected restore, rejects rollback and signed-record tampering, and confirms public-only recovery. Inspect `CLEAN-RESTORE.json` and `MANIFEST.json` in `clean-machine-restore-<commit>-<run ID>-<attempt>`. Reviewer packaging requires both jobs to succeed. [Clean-machine restore](CLEAN_MACHINE_RESTORE.md)
 
 ## Inspect a run
 
