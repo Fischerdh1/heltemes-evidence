@@ -17,7 +17,7 @@ class MonitorCIGateTests(unittest.TestCase):
         names = (
             'python', 'terraform', 'network_lab', 'monitor_reboot', 'monitor_powercut', 'monitor_automatic',
             'monitor_archive', 'monitor_archive_reboot', 'monitor_archive_powercut', 'monitor_archive_retry',
-            'clean_restore', 'key_rotation_restore',
+            'clean_restore', 'key_rotation_restore', 'monitor_boot', 'monitor_boot_powercut',
         )
         self.assertIn('    if: ${{ always() }}\n', reviewer)
         self.assertIn(f"    needs: [{', '.join(names)}]\n", reviewer)
@@ -94,6 +94,44 @@ class MonitorCIGateTests(unittest.TestCase):
             [line.strip() for line in artifact.splitlines()],
             ['work/key-rotation-restore/REPORT.json', 'work/key-rotation-restore/MANIFEST.json'],
         )
+
+    def test_automatic_boot_jobs_run_and_retain_only_bounded_evidence(self):
+        workflow = CI_WORKFLOW.read_text()
+        cases = (
+            ('monitor_boot', 'monitor_boot_powercut', 'network-monitor-boot',
+             'network_monitor_boot_vm.py', ('NORMAL.json', 'FAILED.json')),
+            ('monitor_boot_powercut', 'key_rotation_restore', 'network-monitor-boot-powercut',
+             'network_monitor_boot_powercut_vm.py', ()),
+        )
+        for name, following, output, script, extra in cases:
+            with self.subTest(job=name):
+                job = workflow.split(f'\n  {name}:\n', 1)[1].split(f'\n  {following}:\n', 1)[0]
+                self.assertIn('    needs: [python]\n', job)
+                self.assertIn('    runs-on: ubuntu-24.04\n', job)
+                self.assertIn('    timeout-minutes: 23\n', job)
+                self.assertNotIn('\n    if:', job)
+                self.assertNotIn('continue-on-error', job)
+                self.assertNotIn('secrets.', job)
+                self.assertIn('          persist-credentials: false\n', job)
+                self.assertIn('REVIEWER_PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}', job)
+                self.assertIn(f'python3 -I -S -B scripts/{script} --output work/{output}', job)
+                actions = [line.split('uses: ', 1)[1] for line in job.splitlines() if 'uses: ' in line]
+                self.assertEqual(len(actions), 3)
+                self.assertRegex(actions[0], r'^actions/checkout@[0-9a-f]{40}(?:\s|$)')
+                for action in actions[1:]:
+                    self.assertRegex(action, r'^actions/upload-artifact@[0-9a-f]{40}(?:\s|$)')
+                success, failure = job.split('        if: failure()\n', 1)
+                artifact = success.split('          path: |\n', 1)[1]
+                members = artifact.split('          if-no-files-found: error\n', 1)[0].splitlines()
+                self.assertCountEqual(
+                    [line.strip() for line in members],
+                    [f'work/{output}/publish/{file}' for file in
+                     ('REPORT.json', 'VM.json', 'BEFORE.json', *extra, 'RECOVERED.json', 'MANIFEST.json')],
+                )
+                self.assertIn('retention-days: 30', success)
+                self.assertEqual([line.strip() for line in failure.splitlines() if 'path:' in line],
+                                 [f'path: work/{output}/staging/FAILURE.json'])
+                self.assertIn('retention-days: 7', failure)
 
     def test_archive_retry_job_runs_the_vm_and_uploads_only_public_evidence(self):
         workflow = CI_WORKFLOW.read_text()

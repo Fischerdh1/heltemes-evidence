@@ -22,6 +22,8 @@ The `clean_restore` job runs six synthetic backup and signing checks on a fresh 
 
 The `key_rotation_restore` job runs the five-case [key rotation restore drill](KEY_ROTATION_RESTORE_DRILL.md) on the standard Linux runner. It checks both matching backup and receipt pairs, rejects both cross-key mismatches, and blocks signing from a public-only restore. Reviewer packaging requires this job to succeed. The `key-rotation-restore-<commit>-<run ID>-<attempt>` artifact retains only `REPORT.json` and `MANIFEST.json` for 30 days. The report identifies the tested commit and, on pull requests, the proposed branch head separately.
 
+The `monitor_boot` and `monitor_boot_powercut` jobs run in parallel after the Python test jobs. The [automatic boot guide](NETWORK_MONITOR_BOOT.md) covers the orderly reboot, the firewall setup failure, and the abrupt guest power cut on a separate VM. The reviewer guard requires both jobs to succeed before packaging. Successful jobs retain the source-bound reports and SHA-256 manifests for 30 days. Failed jobs can retain a sanitized diagnostic for seven days.
+
 ## Inspect a run
 
 1. Open the repository's **Actions** tab and select the relevant `Verify project` run.
